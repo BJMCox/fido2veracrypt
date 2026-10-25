@@ -1,0 +1,58 @@
+#compdef fido2veracrypt
+
+# Containers that have a slot file beside them come first, then any file.
+_fido2veracrypt_containers() {
+  local -a slotted
+  slotted=(${(f)"$(print -rl -- *.fido2veracrypt_meta(N:r))"})
+  _alternative \
+    'slotted:container with a slot file:compadd -a slotted' \
+    'files:file:_files'
+}
+
+_fido2veracrypt_labels() {
+  local container=${words[3]}
+  local -a labels
+  labels=(${(f)"$(fido2veracrypt list-keys $container 2>/dev/null | grep -v '^(' | sed -n 's/  .*//p')"})
+  compadd -a labels
+}
+
+_fido2veracrypt() {
+  local -a commands
+  commands=(
+    'create:make a container and enroll the plugged-in key'
+    'adopt:enroll a key for an existing container'
+    'open:unlock and mount a container'
+    'close:unmount a container, or every open one'
+    'add-key:enroll another key'
+    'remove-key:remove lost or stolen keys and change the passphrase'
+    'rotate:change the passphrase'
+    'status:show open volumes or one container'
+    'list-keys:list the enrolled keys'
+    'completions:print the shell completion script'
+    'help:show the help text'
+  )
+  if (( CURRENT == 2 )); then
+    _describe command commands
+    return
+  fi
+  case $words[2] in
+    create)
+      _arguments '2:container:_fido2veracrypt_containers' '--size[size, with K, M, G, or T]:size:' '--label[key label]:label:' ;;
+    adopt)
+      _arguments '2:container:_fido2veracrypt_containers' '--label[key label]:label:' ;;
+    open|rotate|list-keys)
+      _arguments '2:container:_fido2veracrypt_containers' ;;
+    close)
+      _arguments '2::container:_fido2veracrypt_containers' '--force[close even with files open]' ;;
+    add-key)
+      _arguments '2:container:_fido2veracrypt_containers' '--label[key label]:label:' '--recovery[use the recovery passphrase]' ;;
+    remove-key)
+      _arguments '2:container:_fido2veracrypt_containers' '*--label[key to remove]:label:_fido2veracrypt_labels' ;;
+    status)
+      _arguments '2::container:_fido2veracrypt_containers' ;;
+    completions)
+      _arguments '2:shell:(zsh bash)' ;;
+  esac
+}
+
+_fido2veracrypt "$@"

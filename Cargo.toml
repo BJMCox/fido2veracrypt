@@ -1,0 +1,20 @@
+[package]
+name = "fido2veracrypt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0"
+authors = ["Jessica Cox <jmcox@posteo.de>"]
+description = "Opens VeraCrypt containers with a FIDO2 security key"
+publish = false
+
+[dependencies]
+anyhow = "1"
+fido2kit = { git = "https://github.com/BJMCox/fido2kit.git", rev = "8a6f5112de285c2854921affd92a28892048d35d" } # v0.2.0
+getrandom = "0.4"
+rpassword = "7"
+toml = "1"
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
