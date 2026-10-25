@@ -151,3 +151,17 @@ fn a_change_names_the_new_hash_and_the_current_one_only_when_known() {
     assert!(known.contains(&"--new-hash=Argon2".to_owned()));
     assert_eq!(known.last().unwrap(), "/s.hc");
 }
+
+#[test]
+fn a_busy_volume_is_recognized_on_both_systems() {
+    let mac = "Error: The volume is in use. Close files and applications using it, then retry unmounting.";
+    let linux = "Error: umount: /media/veracrypt1: target is busy.";
+    assert_eq!(close_outcome(false, mac).unwrap(), Close::Busy);
+    assert_eq!(close_outcome(false, linux).unwrap(), Close::Busy);
+    assert_eq!(
+        close_outcome(false, "Error: No such volume is mounted.").unwrap(),
+        Close::NotOpen
+    );
+    assert_eq!(close_outcome(true, "").unwrap(), Close::Closed);
+    assert!(close_outcome(false, "Error: something else").is_err());
+}

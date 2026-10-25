@@ -233,16 +233,7 @@ impl VeraCrypt for Real {
             command
         };
         let output = run(&mut command, None)?;
-        let said = text(&output);
-        Ok(if output.status.success() {
-            Close::Closed
-        } else if said.contains("in use") {
-            Close::Busy
-        } else if said.contains("No such volume") {
-            Close::NotOpen
-        } else {
-            bail!("VeraCrypt could not close the container: {}", said.trim())
-        })
+        close_outcome(output.status.success(), &text(&output))
     }
 
     fn list(&self) -> Result<Vec<Volume>> {
@@ -374,6 +365,20 @@ pub fn mount_args(container: &Path, hash: Option<&str>, linux: bool, mount: bool
     }
     args.push(container.display().to_string());
     args
+}
+
+/// What a `veracrypt -u` run reports. A busy volume reads "in use" from VeraCrypt on macOS and
+/// "target is busy" from umount on Linux.
+pub fn close_outcome(success: bool, said: &str) -> Result<Close> {
+    Ok(if success {
+        Close::Closed
+    } else if said.contains("in use") || said.contains("target is busy") {
+        Close::Busy
+    } else if said.contains("No such volume") {
+        Close::NotOpen
+    } else {
+        bail!("VeraCrypt could not close the container: {}", said.trim())
+    })
 }
 
 /// Parses `veracrypt --text -l -v`, whose labeled lines keep paths with spaces intact.
