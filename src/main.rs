@@ -10,14 +10,14 @@ use fido2veracrypt::ui::Terminal;
 use fido2veracrypt::veracrypt::{Close, Mount, Real, VeraCrypt, Volume};
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let command = match cli::parse(&args) {
-        Ok(command) => command,
-        Err(error) => {
-            eprintln!("{error:#}");
-            return ExitCode::from(2);
-        }
-    };
+    let command =
+        match cli::utf8_args(std::env::args_os().skip(1)).and_then(|args| cli::parse(&args)) {
+            Ok(command) => command,
+            Err(error) => {
+                eprintln!("{error:#}");
+                return ExitCode::from(2);
+            }
+        };
     let vc = Lazy::default();
     let result = commands::run(
         command,
@@ -77,8 +77,8 @@ impl VeraCrypt for Lazy {
         self.with(|vc| vc.list())
     }
 
-    fn change(&self, container: &Path, old: &str, new: &str) -> Result<()> {
-        self.with(|vc| vc.change(container, old, new))
+    fn change(&self, container: &Path, old: &str, old_hash: Option<&str>, new: &str) -> Result<()> {
+        self.with(|vc| vc.change(container, old, old_hash, new))
     }
 
     fn set_label(&self, mount_point: &Path, label: &str) -> Result<()> {

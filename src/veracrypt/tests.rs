@@ -45,7 +45,7 @@ fn versions_below_the_minimum_are_refused() {
 
 #[test]
 fn mount_arguments_name_the_hash_and_never_take_the_passphrase() {
-    let args = mount_args(Path::new("/s.hc"), Some("Argon2"), true);
+    let args = mount_args(Path::new("/s.hc"), Some("Argon2"), true, true);
     assert!(args.contains(&"--hash=Argon2".to_owned()));
     assert!(args.contains(&"--stdin".to_owned()));
     assert!(args.contains(&"--fs-options=nosuid,nodev".to_owned()));
@@ -56,7 +56,7 @@ fn mount_arguments_name_the_hash_and_never_take_the_passphrase() {
             .any(|a| a.starts_with("-p") || a.starts_with("--password"))
     );
     assert!(
-        !mount_args(Path::new("/s.hc"), None, false)
+        !mount_args(Path::new("/s.hc"), None, false, true)
             .iter()
             .any(|a| a.starts_with("--hash"))
     );
@@ -139,4 +139,15 @@ fn a_change_without_the_success_line_fails() {
         "echo 'Error: Incorrect password.'\nexit 1\n",
     ));
     assert!(drive_change(&mut command, "old", "new", TIMEOUT).is_err());
+}
+
+#[test]
+fn a_change_names_the_new_hash_and_the_current_one_only_when_known() {
+    let unknown = change_args(Path::new("/s.hc"), None);
+    assert!(unknown.contains(&"--new-hash=Argon2".to_owned()));
+    assert!(!unknown.iter().any(|a| a.starts_with("--hash")));
+    let known = change_args(Path::new("/s.hc"), Some("SHA-512"));
+    assert!(known.contains(&"--hash=SHA-512".to_owned()));
+    assert!(known.contains(&"--new-hash=Argon2".to_owned()));
+    assert_eq!(known.last().unwrap(), "/s.hc");
 }

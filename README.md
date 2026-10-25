@@ -57,7 +57,7 @@ With several keys plugged in, all of them blink: touch the one to use. Then ente
 
 ### The recovery passphrase
 
-`create`, `adopt`, `rotate`, and `remove-key` show a new recovery passphrase before they change anything: 52 characters in groups of 4. Write it down, keep it away from the drive, and type its last group back when asked. Nothing is written until you do.
+`create`, `adopt`, `rotate`, and `remove-key` show a new recovery passphrase on the terminal before they change anything: 52 characters in groups of 4. It never goes to stdout, so a redirect cannot save it. Write it down, keep it away from the drive, and type its last group back when asked. Nothing is written until you do.
 
 To open the container without fido2veracrypt, give VeraCrypt the passphrase exactly as printed, dashes included. If every key is lost or the slot file is gone, `add-key --recovery` enrolls a key again from the printout.
 
@@ -69,7 +69,7 @@ Close a volume with `fido2veracrypt close` before you pull the drive. Ejecting i
 
 VeraCrypt needs root on Linux to open and close volumes. Without further setup, fido2veracrypt runs it through `sudo`, which asks for your password.
 
-To open and close without a password, install the helper. It runs VeraCrypt as root with fixed options, only for containers that have a slot file beside it, so the sudoers rule cannot be used to run VeraCrypt with other options. Do not give your user a password-free rule for `veracrypt` itself: its `--token-lib` option loads any library, so that rule is root for every process you run.
+To open and close without a password, install the helper. It runs VeraCrypt as root with fixed options, mounts only exFAT, and acts only on containers that have a slot file beside them, so the sudoers rule cannot be used to run VeraCrypt with other options. Do not give your user a password-free rule for `veracrypt` itself: its `--token-lib` option loads any library, so that rule is root for every process you run.
 
 ```sh
 cargo build --release
@@ -78,7 +78,7 @@ echo "$USER ALL=(root) NOPASSWD: /usr/local/libexec/fido2veracrypt-helper" > /tm
 sudo visudo -cf /tmp/fido2veracrypt.sudoers && sudo install -o root -g root -m 0440 /tmp/fido2veracrypt.sudoers /etc/sudoers.d/fido2veracrypt
 ```
 
-`create` still asks for your sudo password, because it formats the volume as root.
+`create` still asks for your sudo password, because it formats the volume as root. So do `adopt` and `add-key --recovery`, because the helper refuses a container that has no slot file yet.
 
 ## Limits
 

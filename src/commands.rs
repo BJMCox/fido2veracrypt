@@ -113,6 +113,14 @@ fn create(t: &mut Tools, container: &Path, size: u64, label: &str) -> Result<()>
         .vc
         .create(container, size, passphrase.as_str(), &slots::label(container))
     {
+        // A container file left behind is not usable, and only the owner should delete files.
+        Err(error) if container.exists() => {
+            return Err(error.context(format!(
+                "The container {} was made but not finished. Delete it and {}, then run create again",
+                container.display(),
+                slot.display()
+            )));
+        }
         Err(error) => {
             let _ = std::fs::remove_file(&slot);
             return Err(error.context("The container was not created, and its slot file was removed"));
@@ -442,9 +450,7 @@ fn show_recovery(ui: &mut dyn Ui, passphrase: &Passphrase) -> Result<()> {
     ui.say(
         "Your recovery passphrase. Write it down and keep it away from the drive. VeraCrypt alone opens the container with it, typed exactly as shown, dashes included:",
     );
-    ui.say("");
-    ui.say(passphrase.as_str());
-    ui.say("");
+    ui.show_secret(passphrase.as_str())?;
     let typed = ui.ask("Type its last group to confirm you wrote it down: ")?;
     let typed: String = typed
         .trim()
@@ -496,16 +502,24 @@ fn unlock(t: &mut Tools, container: &Path) -> Result<Unlocked> {
 /// A pending passphrase means a change stopped part way. The header holds either value, so the
 /// one that opens it decides what is left. A removed key may know the old passphrase, so this
 /// runs before anything else uses the volume.
+///
+/// A change that fails again leaves the change pending and the old passphrase in the header.
+/// Refusing to go on would not make the header refuse the old passphrase, so it only warns, and
+/// the command goes on with the current passphrase.
 fn finish_pending(t: &mut Tools, container: &Path, unlocked: &mut Unlocked) -> Result<()> {
     if !unlocked.vault.has_pending(SECRET) {
         return Ok(());
     }
     let current = current(unlocked)?;
     let pending = pending(unlocked)?;
-    if t.vc
-        .opens(container, &current, hash_of(&unlocked.vault).as_deref())?
-    {
-        t.vc.change(container, &current, &pending)?;
+    let hash = hash_of(&unlocked.vault);
+    if t.vc.opens(container, &current, hash.as_deref())? {
+        if let Err(error) = t.vc.change(container, &current, hash.as_deref(), &pending) {
+            t.ui.say(&format!(
+                "Warning: an earlier passphrase change could not finish: {error:#}. The old passphrase still opens this container, so any key removed since may still open it with an old copy of the slot file. The change stays pending, and the next unlock tries it again."
+            ));
+            return Ok(());
+        }
     } else {
         ensure!(
             t.vc.opens(container, &pending, Some(HASH))?,
@@ -521,7 +535,12 @@ fn finish_pending(t: &mut Tools, container: &Path, unlocked: &mut Unlocked) -> R
 fn apply_pending(vc: &dyn VeraCrypt, container: &Path, unlocked: &mut Unlocked) -> Result<()> {
     let current = current(unlocked)?;
     let pending = pending(unlocked)?;
-    vc.change(container, &current, &pending)?;
+    vc.change(
+        container,
+        &current,
+        hash_of(&unlocked.vault).as_deref(),
+        &pending,
+    )?;
     commit(unlocked)
 }
 

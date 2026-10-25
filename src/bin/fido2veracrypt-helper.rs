@@ -3,11 +3,11 @@
 
 use std::process::ExitCode;
 
-use fido2veracrypt::helper;
+use fido2veracrypt::{cli, helper};
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match helper::parse(&args).and_then(|action| helper::run(&action)) {
+    let parsed = cli::utf8_args(std::env::args_os().skip(1)).and_then(|args| helper::parse(&args));
+    match parsed.and_then(|action| helper::run(&action)) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("{error:#}");

@@ -35,6 +35,8 @@ struct FakeVeraCrypt {
     containers: RefCell<BTreeMap<PathBuf, Container>>,
     crash: RefCell<Option<Crash>>,
     fail_create: bool,
+    /// Fails after writing the container file, as a failed format on Linux does.
+    fail_after_file: bool,
 }
 
 impl FakeVeraCrypt {
@@ -64,6 +66,10 @@ impl VeraCrypt for FakeVeraCrypt {
     ) -> Result<Option<anyhow::Error>> {
         if self.fail_create {
             bail!("VeraCrypt failed");
+        }
+        if self.fail_after_file {
+            std::fs::write(container, b"unformatted").unwrap();
+            bail!("mkfs.exfat failed");
         }
         self.insert(
             container,
@@ -121,13 +127,17 @@ impl VeraCrypt for FakeVeraCrypt {
             .collect())
     }
 
-    fn change(&self, container: &Path, old: &str, new: &str) -> Result<()> {
+    fn change(&self, container: &Path, old: &str, old_hash: Option<&str>, new: &str) -> Result<()> {
         let crash = *self.crash.borrow();
         if crash == Some(Crash::BeforeHeader) {
             bail!("crashed before the header");
         }
         let mut containers = self.containers.borrow_mut();
         let stored = containers.get_mut(container).unwrap();
+        // VeraCrypt's -C tries the old password only with the named key derivation.
+        if old_hash.is_some_and(|h| stored.hash.as_deref() != Some(h)) {
+            bail!("Incorrect PRF (hash)");
+        }
         if stored.passphrase != old {
             bail!("Incorrect password");
         }
@@ -205,6 +215,8 @@ impl Keys for FakeKeys {
 /// group, or `wrong` when `confirm` is false.
 struct FakeUi {
     said: Vec<String>,
+    /// What went to the terminal only.
+    shown: Vec<String>,
     secrets: VecDeque<String>,
     confirm: bool,
 }
@@ -213,6 +225,7 @@ impl Default for FakeUi {
     fn default() -> Self {
         Self {
             said: Vec::new(),
+            shown: Vec::new(),
             secrets: VecDeque::new(),
             confirm: true,
         }
@@ -221,10 +234,8 @@ impl Default for FakeUi {
 
 impl FakeUi {
     fn shown_passphrase(&self) -> String {
-        self.said
-            .iter()
-            .rev()
-            .find(|line| line.len() == 64 && line.split('-').count() == 13)
+        self.shown
+            .last()
             .cloned()
             .expect("a recovery passphrase was shown")
     }
@@ -237,6 +248,11 @@ impl FakeUi {
 impl Ui for FakeUi {
     fn say(&mut self, text: &str) {
         self.said.push(text.to_owned());
+    }
+
+    fn show_secret(&mut self, text: &str) -> Result<()> {
+        self.shown.push(text.to_owned());
+        Ok(())
     }
 
     fn secret(&mut self, _: &str) -> Result<Zeroizing<String>> {
@@ -614,4 +630,41 @@ fn status_names_a_half_closed_volume() {
         "{}",
         world.ui.output()
     );
+}
+
+#[test]
+fn a_change_that_keeps_failing_still_opens_with_the_current_passphrase() {
+    let mut world = World::new();
+    existing(&world, "old.hc");
+    world.ui.secrets.push_back("old password".into());
+    *world.vc.crash.borrow_mut() = Some(Crash::BeforeHeader);
+    assert!(world.run("adopt DIR/old.hc --label k").is_err());
+    // The change keeps failing, for example after a VeraCrypt update changed its prompts.
+    world.run("open DIR/old.hc").unwrap();
+    assert!(world.vc.get(&world.path("old.hc")).mounted);
+    assert!(
+        world.ui.output().contains("could not finish"),
+        "{}",
+        world.ui.output()
+    );
+    assert!(world.slot("old.hc").has_pending(slots::SECRET));
+}
+
+#[test]
+fn a_create_that_fails_after_writing_the_container_keeps_both_files_and_names_them() {
+    let mut world = World::new();
+    world.vc.fail_after_file = true;
+    let error = error_of(world.run("create DIR/a.hc --size 1G --label k"));
+    assert!(world.path("a.hc").exists());
+    assert!(slots::path(&world.path("a.hc")).exists());
+    assert!(error.contains("Delete"), "{error}");
+}
+
+#[test]
+fn the_recovery_passphrase_goes_to_the_terminal_and_never_to_stdout() {
+    // A redirect such as `| tee log` would otherwise write it to disk.
+    let mut world = World::new();
+    world.run("create DIR/a.hc --size 1G --label k").unwrap();
+    let shown = world.ui.shown_passphrase();
+    assert!(!world.ui.output().contains(&shown));
 }

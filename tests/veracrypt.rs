@@ -48,7 +48,7 @@ fn real_veracrypt_creates_opens_changes_and_closes_a_container() {
     );
 
     // The prompts of a real `veracrypt -C` must match the driver.
-    vc.change(&container, FIRST, SECOND).unwrap();
+    vc.change(&container, FIRST, Some(HASH), SECOND).unwrap();
     assert!(!vc.opens(&container, FIRST, Some(HASH)).unwrap());
 
     assert_eq!(
@@ -99,4 +99,41 @@ fn real_veracrypt_creates_opens_changes_and_closes_a_container() {
     }
     assert_eq!(vc.close(&container, false).unwrap(), Close::Closed);
     assert!(vc.list().unwrap().iter().all(|v| v.container != container));
+}
+
+#[test]
+fn real_veracrypt_changes_a_sha512_container_to_argon2() {
+    if !enabled() {
+        eprintln!("skipped: set FIDO2VERACRYPT_IT=1 to run");
+        return;
+    }
+    let vc = Real::find(None).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let container = dir.path().canonicalize().unwrap().join("old.hc");
+    // A container as plain VeraCrypt makes it by default, with SHA-512 key derivation.
+    let mut create = std::process::Command::new(vc.binary());
+    create
+        .args(["--text", "--non-interactive", "--stdin", "--create"])
+        .arg(&container)
+        .args([
+            "--size=2097152",
+            "--volume-type=normal",
+            "--encryption=AES",
+            "--hash=SHA-512",
+            "--filesystem=none",
+            "--pim=0",
+            "-k",
+            "",
+            "--random-source=/dev/urandom",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null());
+    let mut child = create.spawn().unwrap();
+    use std::io::Write;
+    writeln!(child.stdin.take().unwrap(), "{FIRST}").unwrap();
+    assert!(child.wait().unwrap().success());
+
+    vc.change(&container, FIRST, None, SECOND).unwrap();
+    assert!(vc.opens(&container, SECOND, Some(HASH)).unwrap());
+    assert!(!vc.opens(&container, FIRST, None).unwrap());
 }

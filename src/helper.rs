@@ -3,8 +3,9 @@
 //! Root VeraCrypt with free options would be root code execution: `--token-lib` loads any
 //! library, and `--create` with `--force` overwrites any file.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -25,15 +26,16 @@ const HASHES: [&str; 6] = [
 
 #[derive(Debug)]
 pub enum Action {
-    /// Mounts the container. The passphrase comes on stdin.
+    /// Mounts the container. The passphrase comes on stdin. Without a hash, VeraCrypt tries each.
     Open {
         container: PathBuf,
-        hash: String,
+        hash: Option<String>,
     },
-    /// Attaches the container without a filesystem, to test a passphrase from stdin.
+    /// Attaches the container without a filesystem and detaches it again, to test a passphrase
+    /// from stdin.
     Check {
         container: PathBuf,
-        hash: String,
+        hash: Option<String>,
     },
     Close {
         container: PathBuf,
@@ -43,9 +45,11 @@ pub enum Action {
 
 pub fn parse(args: &[String]) -> Result<Action> {
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
-    let hash = |hash: &str| {
-        ensure!(HASHES.contains(&hash), "Unknown key derivation {hash:?}");
-        Ok(hash.to_owned())
+    // `any` lets VeraCrypt try every key derivation, for a header whose one is not known.
+    let hash = |hash: &str| match hash {
+        "any" => Ok(None),
+        hash if HASHES.contains(&hash) => Ok(Some(hash.to_owned())),
+        hash => bail!("Unknown key derivation {hash:?}"),
     };
     Ok(match words.as_slice() {
         ["open", container, h] => Action::Open {
@@ -65,7 +69,7 @@ pub fn parse(args: &[String]) -> Result<Action> {
             force: true,
         },
         _ => bail!(
-            "Usage: fido2veracrypt-helper open|check <container> <hash>, or close <container> [--force]"
+            "Usage: fido2veracrypt-helper open|check <container> <hash|any>, or close <container> [--force]"
         ),
     })
 }
@@ -94,40 +98,70 @@ pub fn checked(container: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-pub fn veracrypt_args(action: &Action) -> Vec<String> {
+/// The VeraCrypt runs for `action`, in order. A check detaches in the same call, so a client
+/// killed in between cannot leave a root device attached.
+pub fn veracrypt_steps(action: &Action) -> Vec<Vec<String>> {
     match action {
-        Action::Open { container, hash } => mount_args(container, Some(hash), true),
-        Action::Check { container, hash } => {
-            let mut args = mount_args(container, Some(hash), true);
-            args.insert(args.len() - 1, "--filesystem=none".to_owned());
-            args
+        Action::Open { container, hash } => {
+            vec![mount_args(container, hash.as_deref(), true, true)]
         }
-        Action::Close { container, force } => {
-            let mut args = vec!["--text".to_owned(), "--non-interactive".to_owned()];
-            if *force {
-                args.push("--force".to_owned());
-            }
-            args.push("-u".to_owned());
-            args.push(container.display().to_string());
-            args
-        }
+        Action::Check { container, hash } => vec![
+            mount_args(container, hash.as_deref(), true, false),
+            close_args(container, false),
+        ],
+        Action::Close { container, force } => vec![close_args(container, *force)],
     }
 }
 
-/// Runs VeraCrypt with a cleared environment and passes on its exit status. Its stdin, stdout,
-/// and stderr are the helper's own, so the passphrase flows through and messages flow back.
+fn close_args(container: &Path, force: bool) -> Vec<String> {
+    let mut args = vec!["--text".to_owned(), "--non-interactive".to_owned()];
+    if force {
+        args.push("--force".to_owned());
+    }
+    args.push("-u".to_owned());
+    args.push(container.display().to_string());
+    args
+}
+
+/// The environment VeraCrypt gets: a fixed `PATH`, and sudo's record of the real user, which
+/// VeraCrypt needs to mount the volume for that user. sudo sets the `SUDO_` variables itself and,
+/// with its default `env_reset`, drops any the user passes, so they cannot name another user.
+pub fn environment(from: impl Fn(&str) -> Option<OsString>) -> Vec<(String, OsString)> {
+    let mut env = vec![(
+        "PATH".to_owned(),
+        OsString::from("/usr/sbin:/usr/bin:/sbin:/bin"),
+    )];
+    for name in ["SUDO_UID", "SUDO_GID", "SUDO_USER"] {
+        if let Some(value) = from(name) {
+            env.push((name.to_owned(), value));
+        }
+    }
+    env
+}
+
+/// Runs each step with only [`environment`], stops at the first failure, and passes on its exit
+/// status. The first step reads the helper's stdin, so the passphrase flows through, and messages
+/// flow back on stdout and stderr.
 pub fn run(action: &Action) -> Result<ExitCode> {
-    let status = Command::new(VERACRYPT)
-        .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .args(veracrypt_args(action))
-        .status()
-        .with_context(|| format!("Cannot run {VERACRYPT}"))?;
-    Ok(match status.code() {
-        Some(0) => ExitCode::SUCCESS,
-        Some(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
-        None => ExitCode::FAILURE,
-    })
+    for (index, args) in veracrypt_steps(action).into_iter().enumerate() {
+        let status = Command::new(VERACRYPT)
+            .env_clear()
+            .envs(environment(|name| std::env::var_os(name)))
+            .args(args)
+            .stdin(if index == 0 {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            .status()
+            .with_context(|| format!("Cannot run {VERACRYPT}"))?;
+        match status.code() {
+            Some(0) => {}
+            Some(code) => return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1))),
+            None => return Ok(ExitCode::FAILURE),
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]

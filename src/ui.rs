@@ -7,6 +7,8 @@ use zeroize::Zeroizing;
 
 pub trait Ui {
     fn say(&mut self, text: &str);
+    /// Shows a secret on the terminal only, never on stdout, so a redirect cannot save it.
+    fn show_secret(&mut self, text: &str) -> Result<()>;
     /// A hidden answer, such as a password.
     fn secret(&mut self, prompt: &str) -> Result<Zeroizing<String>>;
     /// A visible answer.
@@ -18,6 +20,15 @@ pub struct Terminal;
 impl Ui for Terminal {
     fn say(&mut self, text: &str) {
         println!("{text}");
+    }
+
+    fn show_secret(&mut self, text: &str) -> Result<()> {
+        let mut tty = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/tty")
+            .context("The recovery passphrase is shown only on a terminal. Run this from one.")?;
+        writeln!(tty, "\n{text}\n")?;
+        Ok(())
     }
 
     fn secret(&mut self, prompt: &str) -> Result<Zeroizing<String>> {

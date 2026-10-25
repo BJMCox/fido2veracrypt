@@ -254,6 +254,21 @@ impl Words {
     }
 }
 
+/// The arguments as text. `std::env::args` panics on bytes that are not UTF-8, which would break
+/// the exit codes, so this refuses them with an error.
+pub fn utf8_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Vec<String>> {
+    args.into_iter()
+        .map(|arg| {
+            arg.into_string().map_err(|arg| {
+                anyhow!(
+                    "The argument {} is not valid UTF-8. Rename the file.",
+                    arg.to_string_lossy()
+                )
+            })
+        })
+        .collect()
+}
+
 /// Bytes, or a number with K, M, G, or T for powers of 1024.
 pub fn parse_size(text: &str) -> Result<u64> {
     let (digits, shift) = match text.chars().last().map(|c| c.to_ascii_uppercase()) {

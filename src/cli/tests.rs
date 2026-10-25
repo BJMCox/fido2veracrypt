@@ -140,3 +140,14 @@ fn both_completion_scripts_name_every_command_and_flag() {
         assert!(HELP.contains(&format!("  {command}")), "{command}");
     }
 }
+
+#[test]
+fn an_argument_that_is_not_utf8_is_refused_without_a_panic() {
+    use std::os::unix::ffi::OsStringExt;
+    let bad = std::ffi::OsString::from_vec(vec![b'a', 0xff, b'.', b'h', b'c']);
+    assert!(utf8_args([std::ffi::OsString::from("open"), bad]).is_err());
+    assert_eq!(
+        utf8_args([std::ffi::OsString::from("open")]).unwrap(),
+        ["open"]
+    );
+}

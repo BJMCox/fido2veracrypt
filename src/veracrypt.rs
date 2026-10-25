@@ -66,8 +66,10 @@ pub trait VeraCrypt {
     fn opens(&self, container: &Path, passphrase: &str, hash: Option<&str>) -> Result<bool>;
     fn close(&self, container: &Path, force: bool) -> Result<Close>;
     fn list(&self) -> Result<Vec<Volume>>;
-    /// Changes the header from `old` to `new`, with Argon2 key derivation.
-    fn change(&self, container: &Path, old: &str, new: &str) -> Result<()>;
+    /// Changes the header from `old` to `new`, and its key derivation to Argon2. `old_hash` is the
+    /// current key derivation, when known. In `-C` mode VeraCrypt takes it as `--hash`, and the
+    /// new one as `--new-hash`.
+    fn change(&self, container: &Path, old: &str, old_hash: Option<&str>, new: &str) -> Result<()>;
     /// Sets an exFAT label on macOS.
     fn set_label(&self, mount_point: &Path, label: &str) -> Result<()>;
 }
@@ -99,14 +101,20 @@ impl Real {
         })
     }
 
+    /// The VeraCrypt binary in use.
+    pub fn binary(&self) -> &Path {
+        &self.binary
+    }
+
     fn veracrypt(&self) -> Command {
         Command::new(&self.binary)
     }
 
-    /// VeraCrypt as root on Linux: through the helper when it is installed, else through sudo
-    /// with the same fixed options.
+    /// VeraCrypt as root on Linux: through the helper when it is installed and the container has a
+    /// slot file, which the helper requires, else through sudo with the same fixed options. A
+    /// container has no slot file yet during `adopt`, and has lost it in a recovery.
     fn root(&self, action: &str, container: &Path, extra: &[&str], args: Vec<String>) -> Command {
-        if Path::new(HELPER).is_file() {
+        if Path::new(HELPER).is_file() && crate::slots::path(container).is_file() {
             let mut command = Command::new("sudo");
             command.arg(HELPER).arg(action).arg(container).args(extra);
             command
@@ -118,17 +126,15 @@ impl Real {
     }
 
     fn mount_command(&self, container: &Path, hash: Option<&str>, filesystem: bool) -> Command {
-        let mut args = mount_args(container, hash, self.linux);
-        if !filesystem {
-            args.insert(args.len() - 1, "--filesystem=none".to_owned());
-        }
+        let args = mount_args(container, hash, self.linux, filesystem);
         if !self.linux {
             let mut command = self.veracrypt();
             command.args(args);
             return command;
         }
         let action = if filesystem { "open" } else { "check" };
-        self.root(action, container, &[hash.unwrap_or(HASH)], args)
+        // `any` asks the helper to let VeraCrypt try every key derivation.
+        self.root(action, container, &[hash.unwrap_or("any")], args)
     }
 }
 
@@ -156,42 +162,15 @@ impl VeraCrypt for Real {
             String::new(),
             "--random-source=/dev/urandom".into(),
         ]);
-        let mut command = if self.linux {
-            let mut command = Command::new("sudo");
-            command.arg(&self.binary).args(&args);
-            command
-        } else {
-            let mut command = self.veracrypt();
-            command.args(&args);
-            command
-        };
+        // On Linux too the container file is made as the user, so it stays theirs. Only attaching
+        // and formatting need root.
+        let mut command = self.veracrypt();
+        command.args(&args);
         succeed(run(&mut command, Some(passphrase))?, "create the container")?;
         if self.linux {
-            // VeraCrypt cannot label a filesystem, so it attaches the bare volume and mkfs.exfat
-            // formats it with the label.
-            let mut attach = Command::new("sudo");
-            attach
-                .arg(&self.binary)
-                .args(mount_args(container, Some(HASH), true));
-            attach.arg("--filesystem=none");
-            succeed(
-                run(&mut attach, Some(passphrase))?,
-                "attach the new container",
-            )?;
-            let device = self
-                .list()?
-                .into_iter()
-                .find(|v| v.container == container)
-                .and_then(|v| v.device)
-                .context("VeraCrypt attached the container but reported no device")?;
-            let formatted = run(
-                Command::new("sudo").args(["mkfs.exfat", "-L", label, &device]),
-                None,
-            );
-            let detached = self.close(container, false);
-            succeed(formatted?, "format the container with mkfs.exfat")?;
-            detached?;
-            return Ok(None);
+            return self
+                .format_on_linux(container, passphrase, label)
+                .map(|()| None);
         }
         Ok(self.label_new(container, passphrase, label).err())
     }
@@ -277,21 +256,9 @@ impl VeraCrypt for Real {
         Ok(parse_list(&said))
     }
 
-    fn change(&self, container: &Path, old: &str, new: &str) -> Result<()> {
+    fn change(&self, container: &Path, old: &str, old_hash: Option<&str>, new: &str) -> Result<()> {
         let mut command = self.veracrypt();
-        command
-            .args([
-                "--text",
-                "-C",
-                "--pim=0",
-                "--new-pim=0",
-                "-k",
-                "",
-                "--new-keyfiles=",
-                "--random-source=/dev/urandom",
-            ])
-            .arg(format!("--hash={HASH}"))
-            .arg(container);
+        command.args(change_args(container, old_hash));
         drive_change(&mut command, old, new, TIMEOUT)
     }
 
@@ -308,6 +275,46 @@ impl VeraCrypt for Real {
 }
 
 impl Real {
+    /// VeraCrypt cannot label a filesystem, so this attaches the bare volume as root and
+    /// mkfs.exfat formats it with the label. The volume is detached again whatever fails.
+    fn format_on_linux(&self, container: &Path, passphrase: &str, label: &str) -> Result<()> {
+        let mut attach = Command::new("sudo");
+        attach
+            .arg(&self.binary)
+            .args(mount_args(container, Some(HASH), true, false));
+        succeed(
+            run(&mut attach, Some(passphrase))?,
+            "attach the new container",
+        )?;
+        let formatted = (|| {
+            // sudo keeps SUDO_UID, so root's VeraCrypt lists the volume it attached.
+            let listed = run(
+                Command::new("sudo")
+                    .arg(&self.binary)
+                    .args(["--text", "-l", "-v"]),
+                None,
+            )?;
+            let device = parse_list(&text(&listed))
+                .into_iter()
+                .find(|v| v.container == container)
+                .and_then(|v| v.device)
+                .context("VeraCrypt attached the container but reported no device")?;
+            succeed(
+                run(
+                    Command::new("sudo").args(["mkfs.exfat", "-L", label, &device]),
+                    None,
+                )?,
+                "format the container with mkfs.exfat",
+            )
+        })();
+        let detached = self.close(container, false);
+        formatted?;
+        match detached? {
+            Close::Closed | Close::NotOpen => Ok(()),
+            Close::Busy => bail!("The new container is formatted but could not be detached"),
+        }
+    }
+
     /// Opens a new macOS container once to label it, then closes it.
     fn label_new(&self, container: &Path, passphrase: &str, label: &str) -> Result<()> {
         ensure!(
@@ -326,7 +333,32 @@ impl Real {
     }
 }
 
-pub fn mount_args(container: &Path, hash: Option<&str>, linux: bool) -> Vec<String> {
+/// The arguments of `veracrypt -C`. Without `old_hash`, VeraCrypt tries every key derivation.
+pub fn change_args(container: &Path, old_hash: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "--text",
+        "-C",
+        "--pim=0",
+        "--new-pim=0",
+        "-k",
+        "",
+        "--new-keyfiles=",
+        "--random-source=/dev/urandom",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    if let Some(hash) = old_hash {
+        args.push(format!("--hash={hash}"));
+    }
+    args.push(format!("--new-hash={HASH}"));
+    args.push(container.display().to_string());
+    args
+}
+
+/// Mount options. With `mount` false, VeraCrypt attaches the volume without a filesystem. A Linux
+/// mount runs as root, so it accepts only exFAT: any other type would have the kernel parse a
+/// filesystem image the user wrote.
+pub fn mount_args(container: &Path, hash: Option<&str>, linux: bool, mount: bool) -> Vec<String> {
     let mut args: Vec<String> = ["--text", "--non-interactive", "--stdin"]
         .map(str::to_owned)
         .to_vec();
@@ -334,7 +366,10 @@ pub fn mount_args(container: &Path, hash: Option<&str>, linux: bool) -> Vec<Stri
         args.push(format!("--hash={hash}"));
     }
     args.extend(["--pim=0", "-k", "", "--protect-hidden=no"].map(str::to_owned));
-    if linux {
+    if !mount {
+        args.push("--filesystem=none".to_owned());
+    } else if linux {
+        args.push("--filesystem=exfat".to_owned());
         args.push("--fs-options=nosuid,nodev".to_owned());
     }
     args.push(container.display().to_string());
