@@ -53,6 +53,11 @@ jobs:
           curl -fsSL -o "$VERACRYPT_DEB" "https://github.com/veracrypt/VeraCrypt/releases/download/VeraCrypt_1.26.30/$VERACRYPT_DEB"
           echo "$VERACRYPT_SHA256  $VERACRYPT_DEB" | sha256sum -c -
           sudo apt-get install -y "./$VERACRYPT_DEB"
+      - name: Load the kernel's exFAT driver
+        # GitHub's runners use a cloud kernel whose exFAT driver ships in linux-modules-extra.
+        run: |
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+          sudo modprobe exfat
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
