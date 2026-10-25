@@ -231,12 +231,20 @@ fn close(t: &mut Tools, container: Option<PathBuf>, force: bool) -> Result<()> {
             Close::Busy => busy.push(container.display().to_string()),
         }
     }
-    ensure!(
-        busy.is_empty(),
+    if busy.is_empty() {
+        return Ok(());
+    }
+    // Linux cannot unmount a local filesystem with open files, so there even --force fails.
+    if force {
+        bail!(
+            "Even --force could not close {}: a program still has a file open on it. Close that program, then run close again. `fuser -vm <mount point>` names it.",
+            busy.join(", ")
+        );
+    }
+    bail!(
         "A file on {} is still open. Close it and try again, or run close --force, which loses unsaved changes in it.",
         busy.join(", ")
-    );
-    Ok(())
+    )
 }
 
 fn add_key(t: &mut Tools, container: &Path, label: &str) -> Result<()> {

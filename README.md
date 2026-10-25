@@ -29,8 +29,8 @@ Commands:
   open <container>
       Unlock and mount a container.
   close [<container>] [--force]
-      Unmount a container, or every open one. --force closes it even with files open, and
-      unsaved changes in them are lost.
+      Unmount a container, or every open one. On macOS, --force closes it even with files
+      open, and unsaved changes in them are lost.
   add-key <container> --label <label> [--recovery]
       Enroll another key. --recovery uses the recovery passphrase and rebuilds the slot file.
   remove-key <container> --label <label>...
@@ -63,7 +63,7 @@ To open the container without fido2veracrypt, give VeraCrypt the passphrase exac
 
 ### Closing
 
-Close a volume with `fido2veracrypt close` before you pull the drive. Ejecting it in Finder unmounts the filesystem but leaves VeraCrypt holding the volume, still unlocked. `status` shows such a volume as half closed, and `close` finishes the job.
+Close a volume with `fido2veracrypt close` before you pull the drive. If a program still has a file open on it, close that program first. `close --force` closes anyway on macOS, and unsaved changes are lost. Linux cannot close a volume with open files even then, so there close the program, which `fuser -vm <mount point>` names. Ejecting it in Finder unmounts the filesystem but leaves VeraCrypt holding the volume, still unlocked. `status` shows such a volume as half closed, and `close` finishes the job.
 
 ## Linux
 

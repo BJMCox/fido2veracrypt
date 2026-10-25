@@ -17,8 +17,8 @@ Commands:
   open <container>
       Unlock and mount a container.
   close [<container>] [--force]
-      Unmount a container, or every open one. --force closes it even with files open, and
-      unsaved changes in them are lost.
+      Unmount a container, or every open one. On macOS, --force closes it even with files
+      open, and unsaved changes in them are lost.
   add-key <container> --label <label> [--recovery]
       Enroll another key. --recovery uses the recovery passphrase and rebuilds the slot file.
   remove-key <container> --label <label>...

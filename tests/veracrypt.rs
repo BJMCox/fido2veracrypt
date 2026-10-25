@@ -63,9 +63,16 @@ fn real_veracrypt_creates_opens_changes_and_closes_a_container() {
 
     let held = std::fs::File::open(mounted.join("note.txt")).unwrap();
     assert_eq!(vc.close(&container, false).unwrap(), Close::Busy);
-    assert_eq!(vc.close(&container, true).unwrap(), Close::Closed);
+    let forced = vc.close(&container, true).unwrap();
     drop(held);
-    assert_eq!(vc.close(&container, false).unwrap(), Close::NotOpen);
+    if cfg!(target_os = "linux") {
+        // Linux cannot unmount a local filesystem with open files, even with --force.
+        assert_eq!(forced, Close::Busy);
+        assert_eq!(vc.close(&container, false).unwrap(), Close::Closed);
+    } else {
+        assert_eq!(forced, Close::Closed);
+        assert_eq!(vc.close(&container, false).unwrap(), Close::NotOpen);
+    }
 
     assert_eq!(
         vc.mount(&container, SECOND, Some(HASH)).unwrap(),

@@ -37,6 +37,8 @@ struct FakeVeraCrypt {
     fail_create: bool,
     /// Fails after writing the container file, as a failed format on Linux does.
     fail_after_file: bool,
+    /// --force cannot close a busy volume, as on Linux.
+    force_fails: bool,
 }
 
 impl FakeVeraCrypt {
@@ -102,7 +104,7 @@ impl VeraCrypt for FakeVeraCrypt {
         let stored = containers.get_mut(container).unwrap();
         Ok(if !stored.mounted {
             Close::NotOpen
-        } else if stored.busy && !force {
+        } else if stored.busy && (!force || self.force_fails) {
             Close::Busy
         } else {
             stored.mounted = false;
@@ -667,4 +669,22 @@ fn the_recovery_passphrase_goes_to_the_terminal_and_never_to_stdout() {
     world.run("create DIR/a.hc --size 1G --label k").unwrap();
     let shown = world.ui.shown_passphrase();
     assert!(!world.ui.output().contains(&shown));
+}
+
+#[test]
+fn a_volume_that_even_force_cannot_close_says_to_close_the_program() {
+    let mut world = World::new();
+    world.run("create DIR/a.hc --size 1G --label k").unwrap();
+    world.run("open DIR/a.hc").unwrap();
+    world.vc.force_fails = true;
+    world
+        .vc
+        .containers
+        .borrow_mut()
+        .get_mut(&world.path("a.hc"))
+        .unwrap()
+        .busy = true;
+    let error = error_of(world.run("close DIR/a.hc --force"));
+    assert!(!error.contains("run close --force"), "{error}");
+    assert!(error.contains("fuser"), "{error}");
 }
