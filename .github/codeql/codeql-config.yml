@@ -1,0 +1,7 @@
+name: fido2veracrypt
+# Unit and integration tests use sample passwords on purpose. CodeQL's Rust analysis does not
+# recognize #[cfg(test)], so exclude the test files rather than reporting them as secrets.
+paths-ignore:
+  - src/**/tests.rs
+  - tests/**
+  - target
