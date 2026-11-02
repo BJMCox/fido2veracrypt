@@ -14,6 +14,17 @@ The main use is a USB drive whose data must stay readable on both systems. Someo
   - Linux: the package for your distribution from the VeraCrypt website, and `exfatprogs`.
 - A FIDO2 security key with hmac-secret and a PIN, of any brand. Keys without a PIN cannot open containers. Set a PIN with the vendor's tool.
 
+### FUSE-T mount timeouts on macOS
+
+If VeraCrypt reports `The operation did not finish in time`, add this setting to `~/.fuse-t/fuse-t.ini`, preserving any existing settings:
+
+```ini
+[Default]
+bonjour=false
+```
+
+FUSE-T then connects directly to localhost instead of using Bonjour discovery. This setting applies to your user's FUSE-T mounts. It works around the [SMB discovery issue](https://github.com/macos-fuse-t/fuse-t/issues/116).
+
 ## Usage
 
 ```text
