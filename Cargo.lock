@@ -429,7 +429,7 @@ dependencies = [
 [[package]]
 name = "fido2kit"
 version = "0.2.0"
-source = "git+https://github.com/BJMCox/fido2kit.git?rev=378d831fc616edaf1d8ddfc6fcd6f3d0d35e11ae#378d831fc616edaf1d8ddfc6fcd6f3d0d35e11ae"
+source = "git+https://github.com/BJMCox/fido2kit.git?rev=cde3c421a5b6c562ed238e251742b53bec36be92#cde3c421a5b6c562ed238e251742b53bec36be92"
 dependencies = [
  "anyhow",
  "base64",

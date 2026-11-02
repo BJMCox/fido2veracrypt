@@ -30,6 +30,10 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
+      - name: Build the Mac app
+        run: ./macos/build.sh
+      - name: Test the Mac app
+        run: swift test --package-path macos
 
   linux:
     name: Lint and test, with real VeraCrypt (Linux)
@@ -64,8 +68,12 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
+      - name: Install the fixed-path Linux helper for integration tests
+        run: |
+          cargo build --release --locked --bin fido2veracrypt-helper
+          sudo install -D -m 755 target/release/fido2veracrypt-helper /usr/local/libexec/fido2veracrypt-helper
       - name: Test with real VeraCrypt
-        run: FIDO2VERACRYPT_IT=1 cargo test --locked --test veracrypt -- --nocapture
+        run: FIDO2VERACRYPT_IT=1 FIDO2VERACRYPT_HELPER_IT=1 cargo test --locked --test veracrypt -- --nocapture --test-threads=1
 
   audit:
     name: Check dependencies for advisories

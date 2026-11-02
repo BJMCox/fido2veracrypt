@@ -1,4 +1,5 @@
 use super::*;
+use std::os::unix::fs::PermissionsExt;
 
 fn words(line: &str) -> Vec<String> {
     line.split_whitespace().map(str::to_owned).collect()
@@ -154,4 +155,33 @@ fn check_attaches_and_detaches_in_one_call() {
     assert!(steps[0].contains(&"--filesystem=none".to_owned()));
     assert!(steps[1].contains(&"-u".to_owned()));
     assert_eq!(steps[1].last().unwrap(), &path.display().to_string());
+}
+
+#[test]
+fn the_helper_checks_its_own_binary_before_any_action() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("veracrypt");
+    let marker = dir.path().join("actions");
+    let action = Action::Close {
+        container: dir.path().join("dummy.hc"),
+        force: false,
+    };
+    for (version, exit, accepted) in [
+        ("1.26.29", 0, false),
+        ("1.26.30", 1, false),
+        ("1.26.30", 0, true),
+    ] {
+        std::fs::write(&binary, format!("#!/bin/sh\nif [ \"$2\" = '--version' ]; then\n  printf 'VeraCrypt {version}\\n'\n  exit {exit}\nfi\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/actions\"\n")).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = run_with_binary(&action, &binary);
+        if accepted {
+            assert_eq!(result.unwrap(), ExitCode::SUCCESS);
+            let calls = std::fs::read_to_string(&marker).unwrap();
+            assert_eq!(calls.lines().count(), 1);
+            assert!(calls.contains("--text --non-interactive -u"));
+        } else {
+            assert!(result.is_err());
+            assert!(!marker.exists());
+        }
+    }
 }

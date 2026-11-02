@@ -40,6 +40,24 @@ fn real_veracrypt_creates_opens_changes_and_closes_a_container() {
             .unwrap()
             .is_none()
     );
+    // Transaction serialization must coexist with every native VeraCrypt operation.
+    let transaction = std::fs::File::open(&container).unwrap();
+    transaction.try_lock().unwrap();
+    if cfg!(target_os = "linux") {
+        if std::env::var_os("FIDO2VERACRYPT_HELPER_IT").is_some_and(|v| v == "1") {
+            assert!(Path::new(fido2veracrypt::veracrypt::HELPER).is_file());
+            assert_eq!(
+                vc.binary().canonicalize().unwrap(),
+                Path::new("/usr/bin/veracrypt").canonicalize().unwrap()
+            );
+        }
+        // The helper's sidecar gate must be present to exercise its actual open/check/close path.
+        std::fs::write(
+            fido2veracrypt::slots::path(&container),
+            b"integration fixture",
+        )
+        .unwrap();
+    }
     assert!(vc.opens(&container, FIRST, Some(HASH)).unwrap());
     assert!(!vc.opens(&container, SECOND, Some(HASH)).unwrap());
     assert_eq!(

@@ -2,6 +2,8 @@
 
 pub mod cli;
 pub mod commands;
+#[cfg(target_os = "macos")]
+mod desktop;
 pub mod helper;
 pub mod keys;
 pub mod passphrase;

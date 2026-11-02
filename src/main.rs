@@ -1,8 +1,8 @@
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use fido2veracrypt::cli;
 use fido2veracrypt::commands::{self, Tools};
 use fido2veracrypt::keys::Fido;
@@ -14,7 +14,7 @@ fn main() -> ExitCode {
         match cli::utf8_args(std::env::args_os().skip(1)).and_then(|args| cli::parse(&args)) {
             Ok(command) => command,
             Err(error) => {
-                eprintln!("{error:#}");
+                eprintln!("{}", format!("{error:#}").escape_debug());
                 return ExitCode::from(2);
             }
         };
@@ -30,7 +30,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{error:#}");
+            eprintln!("{}", format!("{error:#}").escape_debug());
             ExitCode::FAILURE
         }
     }
@@ -43,7 +43,7 @@ struct Lazy(RefCell<Option<Real>>);
 impl Lazy {
     fn with<T>(&self, use_it: impl FnOnce(&Real) -> Result<T>) -> Result<T> {
         if self.0.borrow().is_none() {
-            let real = Real::find(configured()?)?;
+            let real = Real::configured()?;
             *self.0.borrow_mut() = Some(real);
         }
         use_it(self.0.borrow().as_ref().expect("just found"))
@@ -84,36 +84,4 @@ impl VeraCrypt for Lazy {
     fn set_label(&self, mount_point: &Path, label: &str) -> Result<()> {
         self.with(|vc| vc.set_label(mount_point, label))
     }
-}
-
-/// The `veracrypt` path from the optional config file.
-fn configured() -> Result<Option<PathBuf>> {
-    let Some(path) = config_path() else {
-        return Ok(None);
-    };
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("Cannot read {}", path.display())),
-    };
-    let table: toml::Table = text
-        .parse()
-        .with_context(|| format!("Invalid config {}", path.display()))?;
-    Ok(table
-        .get("veracrypt")
-        .and_then(toml::Value::as_str)
-        .map(PathBuf::from))
-}
-
-fn config_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let base = if cfg!(target_os = "macos") {
-        home?.join("Library/Application Support")
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| home.map(|h| h.join(".config")))?
-    };
-    Some(base.join("fido2veracrypt/config.toml"))
 }

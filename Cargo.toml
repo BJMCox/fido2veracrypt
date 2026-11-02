@@ -8,9 +8,12 @@ authors = ["Jessica Cox <jmcox@posteo.de>"]
 description = "Opens VeraCrypt containers with a FIDO2 security key"
 publish = false
 
+[lib]
+crate-type = ["rlib", "staticlib"]
+
 [dependencies]
 anyhow = "1"
-fido2kit = { git = "https://github.com/BJMCox/fido2kit.git", rev = "378d831fc616edaf1d8ddfc6fcd6f3d0d35e11ae" } # v0.2.0
+fido2kit = { git = "https://github.com/BJMCox/fido2kit.git", rev = "cde3c421a5b6c562ed238e251742b53bec36be92" }
 getrandom = "0.4"
 rpassword = "7"
 toml = "1"

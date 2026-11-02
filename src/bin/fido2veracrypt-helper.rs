@@ -10,7 +10,7 @@ fn main() -> ExitCode {
     match parsed.and_then(|action| helper::run(&action)) {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("{error:#}");
+            eprintln!("{}", format!("{error:#}").escape_debug());
             ExitCode::from(2)
         }
     }

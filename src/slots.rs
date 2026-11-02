@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result, ensure};
 use fido2kit::App;
 
 /// The relying-party ID and vault domain. It must never change after the first enrollment.
@@ -12,6 +13,16 @@ pub const SECRET: &str = "passphrase";
 /// The secret's metadata key for VeraCrypt's key derivation, so each mount names it.
 pub const HASH_META: &str = "fido2veracrypt.hash";
 const EXTENSION: &str = ".fido2veracrypt_meta";
+
+/// VeraCrypt's text protocol cannot represent line breaks in a path.
+pub(crate) fn validate_path(path: &Path) -> Result<()> {
+    let text = path.to_str().context("The container path must be UTF-8")?;
+    ensure!(
+        !text.contains(['\0', '\r', '\n']),
+        "Container paths cannot contain NUL or line breaks. Rename the file."
+    );
+    Ok(())
+}
 
 /// `<container>.fido2veracrypt_meta`.
 pub fn path(container: &Path) -> PathBuf {

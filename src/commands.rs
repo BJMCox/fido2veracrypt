@@ -1,7 +1,9 @@
 //! What each command does.
 
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use fido2kit::fido::Unlock;
@@ -12,13 +14,44 @@ use crate::cli::{Command, HELP, Shell};
 use crate::keys::Keys;
 use crate::passphrase::Passphrase;
 use crate::slots::{self, APP, HASH_META, SECRET};
-use crate::ui::Ui;
+use crate::ui::{Ui, field};
 use crate::veracrypt::{Close, HASH, HELPER, Mount, VeraCrypt};
 
 pub const ZSH: &str = include_str!("../completions/_fido2veracrypt");
 pub const BASH: &str = include_str!("../completions/fido2veracrypt.bash");
 
 const ANOTHER_CONTAINER: &str = "The passphrase in this slot file does not open this container. Is the slot file from another container?";
+
+// O_NONBLOCK keeps an untrusted FIFO from blocking before descriptor type validation.
+#[cfg(target_os = "macos")]
+const NONBLOCK: i32 = 0x4;
+#[cfg(target_os = "linux")]
+const NONBLOCK: i32 = if cfg!(any(
+    target_arch = "mips",
+    target_arch = "mips64",
+    target_arch = "mips32r6",
+    target_arch = "mips64r6"
+)) {
+    0x80
+} else if cfg!(any(target_arch = "sparc", target_arch = "sparc64")) {
+    0x4000
+} else {
+    0x800
+};
+
+fn open_regular(path: impl AsRef<Path>) -> std::io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Not a regular file",
+        ));
+    }
+    Ok(file)
+}
 
 pub struct Tools<'a> {
     pub vc: &'a dyn VeraCrypt,
@@ -34,29 +67,44 @@ struct Unlocked {
 }
 
 pub fn run(command: Command, t: &mut Tools) -> Result<()> {
+    match &command {
+        Command::Create { label, .. }
+        | Command::Adopt { label, .. }
+        | Command::AddKey { label, .. } => {
+            ensure!(
+                !label.trim().is_empty() && label.len() <= 256,
+                "Give the key a name of at most 256 UTF-8 bytes"
+            );
+        }
+        _ => {}
+    }
     match command {
         Command::Create {
             container,
             size,
             label,
-        } => create(t, &resolve(&container)?, size, &label),
-        Command::Adopt { container, label } => adopt(t, &resolve(&container)?, &label),
-        Command::Open { container } => open(t, &resolve(&container)?),
-        Command::Close { container, force } => {
-            close(t, container.as_deref().map(resolve).transpose()?, force)
+        } => transaction(&container, |container| create(t, container, size, &label)),
+        Command::Adopt { container, label } => {
+            transaction(&container, |container| adopt(t, container, &label))
         }
+        Command::Open { container } => transaction(&container, |container| open(t, container)),
+        Command::Close { container, force } => close(t, container, force),
         Command::AddKey {
             container,
             label,
             recovery: false,
-        } => add_key(t, &resolve(&container)?, &label),
+        } => transaction(&container, |container| add_key(t, container, &label)),
         Command::AddKey {
             container,
             label,
             recovery: true,
-        } => add_key_with_recovery(t, &resolve(&container)?, &label),
-        Command::RemoveKey { container, labels } => remove_key(t, &resolve(&container)?, &labels),
-        Command::Rotate { container } => rotate(t, &resolve(&container)?),
+        } => transaction(&container, |container| {
+            add_key_with_recovery(t, container, &label)
+        }),
+        Command::RemoveKey { container, labels } => {
+            transaction(&container, |container| remove_key(t, container, &labels))
+        }
+        Command::Rotate { container } => transaction(&container, |container| rotate(t, container)),
         Command::Status { container } => status(t, container.as_deref().map(resolve).transpose()?),
         Command::ListKeys { container } => list_keys(t, &resolve(&container)?),
         Command::Completions { shell } => {
@@ -75,6 +123,100 @@ pub fn run(command: Command, t: &mut Tools) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The lock file stays in place: unlinking it would let another client lock a different inode.
+/// The container lock also serializes hard-link aliases. VeraCrypt itself does not lock files.
+struct Transaction {
+    _path: Option<LockedFile>,
+    _container: Option<LockedFile>,
+}
+
+struct LockedFile(File);
+
+impl LockedFile {
+    fn acquire(file: File) -> Result<Self> {
+        file.try_lock().context("Another command is using this container, or its filesystem cannot lock it. Try again after that command finishes.")?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for LockedFile {
+    fn drop(&mut self) {
+        // A concurrent fork may briefly inherit this open-file description before exec. Closing
+        // only our descriptor would leave its lock held until that child closes its copy.
+        let _ = self.0.unlock();
+    }
+}
+
+impl Transaction {
+    fn acquire(container: &Path) -> Result<Self> {
+        let file = match open_regular(container) {
+            Ok(file) => Some(LockedFile::acquire(file)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let identity = match container.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => container.to_owned(),
+            Err(error) => return Err(error.into()),
+        };
+        let mut name = identity.into_os_string();
+        name.push(".fido2veracrypt_lock");
+        let lock = match open_regular(&name) {
+            Ok(lock) => Some(lock),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&name)
+                {
+                    Ok(lock) => Some(lock),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        Some(open_regular(&name)?)
+                    }
+                    // A read-only source needs no new sidecar. Its inode lock still excludes all
+                    // header transactions; a new Create cannot use an existing container.
+                    Err(error)
+                        if file.is_some()
+                            && matches!(
+                                error.kind(),
+                                std::io::ErrorKind::PermissionDenied
+                                    | std::io::ErrorKind::ReadOnlyFilesystem
+                            ) =>
+                    {
+                        None
+                    }
+                    Err(error) => {
+                        return Err(error)
+                            .context("Cannot create the container's transaction lock");
+                    }
+                }
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let lock = if let Some(lock) = lock {
+            ensure!(
+                std::fs::symlink_metadata(&name)?.is_file(),
+                "The container's transaction lock is not a regular file"
+            );
+            Some(LockedFile::acquire(lock)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            _path: lock,
+            _container: file,
+        })
+    }
+}
+
+fn transaction(container: &Path, action: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    let container = resolve(container)?;
+    let _lock = Transaction::acquire(&container)?;
+    action(&container)
 }
 
 fn create(t: &mut Tools, container: &Path, size: u64, label: &str) -> Result<()> {
@@ -125,8 +267,8 @@ fn create(t: &mut Tools, container: &Path, size: u64, label: &str) -> Result<()>
             let _ = std::fs::remove_file(&slot);
             return Err(error.context("The container was not created, and its slot file was removed"));
         }
-        Ok(Some(label_error)) => t.ui.say(&format!(
-            "The container works, but its label could not be set: {label_error:#}. The next open on macOS tries again."
+        Ok(Some(setup_error)) => t.ui.warn(&format!(
+            "The container was created, but final setup failed: {setup_error:#}. Check whether it is still open before removing the drive."
         )),
         Ok(None) => {}
     }
@@ -196,7 +338,7 @@ fn open(t: &mut Tools, container: &Path) -> Result<()> {
     {
         match t.vc.set_label(untitled, &slots::label(container)) {
             Ok(()) => mount_point = mount_point_after_label(t.vc, container, untitled)?,
-            Err(error) => t.ui.say(&format!(
+            Err(error) => t.ui.warn(&format!(
                 "The volume has no label, and setting one failed: {error:#}"
             )),
         }
@@ -210,9 +352,30 @@ fn open(t: &mut Tools, container: &Path) -> Result<()> {
 
 fn close(t: &mut Tools, container: Option<PathBuf>, force: bool) -> Result<()> {
     let targets = match container {
-        Some(container) => vec![container],
+        Some(container) => {
+            slots::validate_path(&container)?;
+            let absolute = std::path::absolute(&container)?;
+            let volumes = t.vc.list()?;
+            // An attachment keeps its original name even after its source moves or disappears.
+            let attached = volumes
+                .iter()
+                .find(|v| v.container == absolute)
+                .or_else(|| {
+                    let resolved = resolve(&container).ok()?;
+                    volumes.iter().find(|v| v.container == resolved)
+                });
+            match attached {
+                Some(volume) => vec![volume.container.clone()],
+                None => {
+                    t.ui.say(&format!("{} is not open", container.display()));
+                    return Ok(());
+                }
+            }
+        }
         None => {
-            t.vc.list()?
+            let volumes = t.vc.list()?;
+            require_sources(&volumes)?;
+            volumes
                 .into_iter()
                 .map(|v| v.container)
                 .filter(|c| slots::path(c).exists())
@@ -225,6 +388,10 @@ fn close(t: &mut Tools, container: Option<PathBuf>, force: bool) -> Result<()> {
     }
     let mut busy = Vec::new();
     for container in targets {
+        let _lock = container
+            .is_file()
+            .then(|| Transaction::acquire(&container))
+            .transpose()?;
         match t.vc.close(&container, force)? {
             Close::Closed => t.ui.say(&format!("Closed {}", container.display())),
             Close::NotOpen => t.ui.say(&format!("{} is not open", container.display())),
@@ -249,6 +416,7 @@ fn close(t: &mut Tools, container: Option<PathBuf>, force: bool) -> Result<()> {
 
 fn add_key(t: &mut Tools, container: &Path, label: &str) -> Result<()> {
     let mut unlocked = unlock(t, container)?;
+    require_finished(&unlocked)?;
     t.ui.say("Now enroll the new key. If both keys blink, touch the new one.");
     let enrollment = t
         .keys
@@ -267,6 +435,8 @@ fn add_key_with_recovery(t: &mut Tools, container: &Path, label: &str) -> Result
         "No container at {}",
         container.display()
     );
+    let slot = slots::path(container);
+    let original = read_slot(&slot)?;
     let typed = t.ui.secret("Recovery passphrase: ")?;
     let passphrase = Passphrase::parse(&typed)?;
     let argon2 = t.vc.opens(container, passphrase.as_str(), Some(HASH))?;
@@ -293,21 +463,12 @@ fn add_key_with_recovery(t: &mut Tools, container: &Path, label: &str) -> Result
             HASH,
         )?;
     }
-    let slot = slots::path(container);
-    let mut replaced = None;
-    if slot.exists() {
-        let mut name = slot.clone().into_os_string();
-        name.push(format!(".replaced-{}", unix_seconds()));
-        std::fs::rename(&slot, &name)
-            .with_context(|| format!("Cannot rename {}", slot.display()))?;
-        replaced = Some(PathBuf::from(name));
-    }
-    if let Err(error) = vault.save(&slot, true) {
-        if let Some(old) = &replaced {
-            let _ = std::fs::rename(old, &slot);
-        }
-        return Err(error);
-    }
+    // Enrollment can take minutes. Check the actual header again before replacing metadata.
+    ensure!(
+        t.vc.opens(container, passphrase.as_str(), argon2.then_some(HASH))?,
+        "The container changed during enrollment. Its slot file was not replaced. Try recovery again."
+    );
+    let replaced = replace_slot(&mut vault, &slot, original.as_deref())?;
     t.ui.say(&format!(
         "Enrolled {label} as the only key of a new slot file. The passphrase did not change."
     ));
@@ -341,6 +502,7 @@ fn remove_key(t: &mut Tools, container: &Path, labels: &[String]) -> Result<()> 
         unlocks: vec![first],
     };
     finish_pending(t, container, &mut unlocked)?;
+    require_finished(&unlocked)?;
     for (label, id) in &kept {
         if unlocked.unlocks.iter().any(|u| &u.cred_id == id) {
             continue;
@@ -366,6 +528,7 @@ fn remove_key(t: &mut Tools, container: &Path, labels: &[String]) -> Result<()> 
 
 fn rotate(t: &mut Tools, container: &Path) -> Result<()> {
     let mut unlocked = unlock(t, container)?;
+    require_finished(&unlocked)?;
     let new = Passphrase::generate()?;
     show_recovery(t.ui, &new)?;
     unlocked
@@ -380,6 +543,7 @@ fn rotate(t: &mut Tools, container: &Path) -> Result<()> {
 fn status(t: &mut Tools, container: Option<PathBuf>) -> Result<()> {
     let volumes = t.vc.list()?;
     let Some(container) = container else {
+        require_sources(&volumes)?;
         let ours: Vec<_> = volumes
             .iter()
             .filter(|v| slots::path(&v.container).exists())
@@ -421,16 +585,28 @@ fn status(t: &mut Tools, container: Option<PathBuf>) -> Result<()> {
             None => "closed".to_owned(),
         }
     ));
-    let labels: Vec<&str> = vault.keys().iter().map(|k| k.label).collect();
+    let labels: Vec<String> = vault.keys().iter().map(|k| field(k.label)).collect();
     t.ui.say(&format!("Keys: {}", labels.join(", ")));
     t.ui.say(&format!(
         "Key derivation: {}",
-        hash_of(&vault).unwrap_or_else(|| "unknown".to_owned())
+        field(&hash_of(&vault).unwrap_or_else(|| "unknown".to_owned()))
     ));
     if vault.has_pending(SECRET) {
         t.ui.say("A passphrase change is unfinished. The next open finishes it.");
     }
     t.ui.say("(Read without a key, so these details are unverified.)");
+    Ok(())
+}
+
+/// Without its sidecar, an unavailable attachment cannot safely be classified as foreign.
+fn require_sources(volumes: &[crate::veracrypt::Volume]) -> Result<()> {
+    for volume in volumes {
+        ensure!(
+            volume.container.exists(),
+            "An attached volume's source is unavailable: {}. Its ownership is unknown. Close it by naming that exact path.",
+            field(&volume.container.display().to_string())
+        );
+    }
     Ok(())
 }
 
@@ -447,7 +623,10 @@ fn list_keys(t: &mut Tools, container: &Path) -> Result<()> {
         } else {
             ""
         };
-        t.ui.say(&format!("{}  {aaguid}  {created}{migrated}", key.label));
+        t.ui.say(&format!(
+            "{}  {aaguid}  {created}{migrated}",
+            field(key.label)
+        ));
     }
     t.ui.say("(Read without a key, so these entries are unverified.)");
     Ok(())
@@ -459,20 +638,22 @@ fn show_recovery(ui: &mut dyn Ui, passphrase: &Passphrase) -> Result<()> {
         "Your recovery passphrase. Write it down and keep it away from the drive. VeraCrypt alone opens the container with it, typed exactly as shown, dashes included:",
     );
     ui.show_secret(passphrase.as_str())?;
-    let typed = ui.ask("Type its last group to confirm you wrote it down: ")?;
-    let typed: String = typed
-        .trim()
-        .to_ascii_uppercase()
-        .chars()
-        .map(|c| match c {
-            'I' | 'L' => '1',
-            'O' => '0',
-            c => c,
-        })
-        .collect();
+    let typed = Zeroizing::new(ui.ask("Type its last group to confirm you wrote it down: ")?);
+    let typed = Zeroizing::new(
+        typed
+            .trim()
+            .to_ascii_uppercase()
+            .chars()
+            .map(|c| match c {
+                'I' | 'L' => '1',
+                'O' => '0',
+                c => c,
+            })
+            .collect::<String>(),
+    );
     ensure!(
-        typed == passphrase.last_group(),
-        "That is not the last group. Nothing was written. Run the command again."
+        typed.as_str() == passphrase.last_group(),
+        "That is not the last group. The new passphrase was not written. Run the command again."
     );
     Ok(())
 }
@@ -511,9 +692,8 @@ fn unlock(t: &mut Tools, container: &Path) -> Result<Unlocked> {
 /// one that opens it decides what is left. A removed key may know the old passphrase, so this
 /// runs before anything else uses the volume.
 ///
-/// A change that fails again leaves the change pending and the old passphrase in the header.
-/// Refusing to go on would not make the header refuse the old passphrase, so it only warns, and
-/// the command goes on with the current passphrase.
+/// After a failed write, probe both values again. Opening may use a verified old value, but
+/// another slot mutation must not discard an unfinished pending value.
 fn finish_pending(t: &mut Tools, container: &Path, unlocked: &mut Unlocked) -> Result<()> {
     if !unlocked.vault.has_pending(SECRET) {
         return Ok(());
@@ -523,7 +703,18 @@ fn finish_pending(t: &mut Tools, container: &Path, unlocked: &mut Unlocked) -> R
     let hash = hash_of(&unlocked.vault);
     if t.vc.opens(container, &current, hash.as_deref())? {
         if let Err(error) = t.vc.change(container, &current, hash.as_deref(), &pending) {
-            t.ui.say(&format!(
+            if t.vc.opens(container, &pending, Some(HASH))? {
+                commit(unlocked)?;
+                t.ui.warn(&format!(
+                    "The earlier change reported an error ({error:#}), but its new passphrase opens the header. The slot file now records it."
+                ));
+                return Ok(());
+            }
+            ensure!(
+                t.vc.opens(container, &current, hash.as_deref())?,
+                "The failed change left an unknown header state. Both stored passphrases were preserved. Use the recovery printout."
+            );
+            t.ui.warn(&format!(
                 "Warning: an earlier passphrase change could not finish: {error:#}. The old passphrase still opens this container, so any key removed since may still open it with an old copy of the slot file. The change stays pending, and the next unlock tries it again."
             ));
             return Ok(());
@@ -536,6 +727,14 @@ fn finish_pending(t: &mut Tools, container: &Path, unlocked: &mut Unlocked) -> R
     }
     commit(unlocked)?;
     t.ui.say("Finished an interrupted passphrase change.");
+    Ok(())
+}
+
+fn require_finished(unlocked: &Unlocked) -> Result<()> {
+    ensure!(
+        !unlocked.vault.has_pending(SECRET),
+        "The earlier passphrase change is still unfinished. Its stored values were preserved. Run open to retry it before changing keys or rotating again."
+    );
     Ok(())
 }
 
@@ -610,6 +809,7 @@ fn mount_point_after_label(
 
 /// An absolute path with its folder's symlinks resolved, as VeraCrypt reports it in its list.
 fn resolve(path: &Path) -> Result<PathBuf> {
+    slots::validate_path(path)?;
     let name = path
         .file_name()
         .with_context(|| format!("{} names no file", path.display()))?;
@@ -617,17 +817,83 @@ fn resolve(path: &Path) -> Result<PathBuf> {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
-    Ok(parent
+    let resolved = parent
         .canonicalize()
         .with_context(|| format!("Cannot find the folder {}", parent.display()))?
-        .join(name))
+        .join(name);
+    slots::validate_path(&resolved)?;
+    Ok(resolved)
 }
 
-fn unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default()
+fn read_slot(path: &Path) -> Result<Option<Vec<u8>>> {
+    let file = match open_regular(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut bytes = Vec::new();
+    file.take((1 << 20) + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= 1 << 20,
+        "The slot file exceeds 1 MiB. Move it aside before recovery."
+    );
+    Ok(Some(bytes))
+}
+
+fn unique_slot_path(slot: &Path, suffix: &str) -> Result<PathBuf> {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random)?;
+    let random: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    let mut name = slot.as_os_str().to_owned();
+    name.push(format!(".{suffix}-{random}"));
+    Ok(PathBuf::from(name))
+}
+
+/// Stage first, then replace under the vault writer's directory lock. The original file stays
+/// in place until the atomic rename, so a failed save never needs a destructive rollback.
+fn replace_slot(
+    vault: &mut Vault,
+    slot: &Path,
+    original: Option<&[u8]>,
+) -> Result<Option<PathBuf>> {
+    if original.is_none() {
+        vault.save(slot, true)?;
+        return Ok(None);
+    }
+    let stage = unique_slot_path(slot, "recovering")?;
+    vault.save(&stage, true)?;
+    let result = (|| {
+        let dir = File::open(slot.parent().context("The slot file has no directory")?)?;
+        // The operation lock still serializes our clients on exFAT, which cannot lock folders.
+        if let Err(error) = dir.lock()
+            && error.kind() != std::io::ErrorKind::Unsupported
+            && !(cfg!(target_os = "macos") && matches!(error.raw_os_error(), Some(45 | 102)))
+        {
+            return Err(error.into());
+        }
+        ensure!(
+            read_slot(slot)?.as_deref() == original,
+            "The slot file changed during enrollment. Nothing was replaced. Try again."
+        );
+        let backup = unique_slot_path(slot, "replaced")?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&backup)?;
+        file.write_all(original.expect("checked above"))?;
+        file.sync_all()?;
+        std::fs::rename(&stage, slot).with_context(|| {
+            format!(
+                "Cannot replace {}. The old slot remains at {}",
+                slot.display(),
+                backup.display()
+            )
+        })?;
+        Ok(Some(backup))
+    })();
+    let _ = std::fs::remove_file(&stage);
+    result
 }
 
 /// A UTC date from UNIX seconds, by Howard Hinnant's days-to-civil algorithm.
