@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-fido2kit = { git = "https://github.com/BJMCox/fido2kit.git", rev = "8a6f5112de285c2854921affd92a28892048d35d" } # v0.2.0
+fido2kit = { git = "https://github.com/BJMCox/fido2kit.git", rev = "378d831fc616edaf1d8ddfc6fcd6f3d0d35e11ae" } # v0.2.0
 getrandom = "0.4"
 rpassword = "7"
 toml = "1"
