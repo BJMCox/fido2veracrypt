@@ -1,5 +1,5 @@
 use super::*;
-use std::os::unix::fs::PermissionsExt;
+use crate::test_support::write_script;
 
 const PROPERTIES: &str = "\
 Size: 63.8 MiB
@@ -255,7 +255,7 @@ fn ordered_properties_accept_kernel_mounts_but_reject_continuations() {
 fn creation_detaches_even_when_the_label_lookup_fails() {
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("veracrypt");
-    std::fs::write(
+    write_script(
         &script,
         r#"#!/bin/sh
 for arg in "$@"; do
@@ -266,9 +266,7 @@ for arg in "$@"; do
 done
 exit 0
 "#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let vc = Real {
         binary: script,
         linux: false,
@@ -376,8 +374,7 @@ fn fake(dir: &Path, prompts: &[&str], tail: &str) -> PathBuf {
         ));
     }
     body.push_str(tail);
-    std::fs::write(&script, body).unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&script, &body);
     script
 }
 

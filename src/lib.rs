@@ -10,3 +10,6 @@ pub mod passphrase;
 pub mod slots;
 pub mod ui;
 pub mod veracrypt;
+
+#[cfg(test)]
+mod test_support;

@@ -1,5 +1,5 @@
 use super::*;
-use std::os::unix::fs::PermissionsExt;
+use crate::test_support::write_script;
 
 fn words(line: &str) -> Vec<String> {
     line.split_whitespace().map(str::to_owned).collect()
@@ -171,8 +171,12 @@ fn the_helper_checks_its_own_binary_before_any_action() {
         ("1.26.30", 1, false),
         ("1.26.30", 0, true),
     ] {
-        std::fs::write(&binary, format!("#!/bin/sh\nif [ \"$2\" = '--version' ]; then\n  printf 'VeraCrypt {version}\\n'\n  exit {exit}\nfi\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/actions\"\n")).unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_script(
+            &binary,
+            &format!(
+                "#!/bin/sh\nif [ \"$2\" = '--version' ]; then\n  printf 'VeraCrypt {version}\\n'\n  exit {exit}\nfi\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/actions\"\n"
+            ),
+        );
         let result = run_with_binary(&action, &binary);
         if accepted {
             assert_eq!(result.unwrap(), ExitCode::SUCCESS);
