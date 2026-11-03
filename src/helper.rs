@@ -10,10 +10,10 @@ use std::process::{Command, ExitCode, Stdio};
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::slots;
-use crate::veracrypt::mount_args;
+use crate::veracrypt::{check_binary_version, mount_args, run_inherited};
 
 /// Where VeraCrypt's Linux packages install it. The helper never searches `PATH`.
-const VERACRYPT: &str = "/usr/bin/veracrypt";
+pub(crate) const VERACRYPT: &str = "/usr/bin/veracrypt";
 /// VeraCrypt's key derivations.
 const HASHES: [&str; 6] = [
     "Argon2",
@@ -77,6 +77,7 @@ pub fn parse(args: &[String]) -> Result<Action> {
 /// The container's canonical path, if it is an absolute path to a regular file with a slot file
 /// beside it.
 pub fn checked(container: &Path) -> Result<PathBuf> {
+    slots::validate_path(container)?;
     ensure!(
         container.is_absolute(),
         "The container path must be absolute"
@@ -84,6 +85,7 @@ pub fn checked(container: &Path) -> Result<PathBuf> {
     let canonical = container
         .canonicalize()
         .with_context(|| format!("No container at {}", container.display()))?;
+    slots::validate_path(&canonical)?;
     ensure!(
         canonical.metadata()?.is_file(),
         "{} is not a regular file",
@@ -143,18 +145,25 @@ pub fn environment(from: impl Fn(&str) -> Option<OsString>) -> Vec<(String, OsSt
 /// status. The first step reads the helper's stdin, so the passphrase flows through, and messages
 /// flow back on stdout and stderr.
 pub fn run(action: &Action) -> Result<ExitCode> {
+    run_with_binary(action, Path::new(VERACRYPT))
+}
+
+fn command(binary: &Path) -> Command {
+    let mut command = Command::new(binary);
+    command
+        .env_clear()
+        .envs(environment(|name| std::env::var_os(name)));
+    command
+}
+
+fn run_with_binary(action: &Action, binary: &Path) -> Result<ExitCode> {
+    check_binary_version(&mut command(binary))?;
     for (index, args) in veracrypt_steps(action).into_iter().enumerate() {
-        let status = Command::new(VERACRYPT)
-            .env_clear()
-            .envs(environment(|name| std::env::var_os(name)))
-            .args(args)
-            .stdin(if index == 0 {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            })
-            .status()
-            .with_context(|| format!("Cannot run {VERACRYPT}"))?;
+        let status = run_inherited(command(binary).args(args).stdin(if index == 0 {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        }))?;
         match status.code() {
             Some(0) => {}
             Some(code) => return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1))),

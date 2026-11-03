@@ -5,9 +5,38 @@ use std::io::{BufRead, Write};
 use anyhow::{Context, Result};
 use zeroize::Zeroizing;
 
+/// A visible step in a multi-stage operation. This does not change cancellation policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    Authenticate,
+    Connect,
+    Enroll,
+    Recovery,
+    Write,
+}
+
 pub trait Ui {
     fn say(&mut self, text: &str);
-    /// Shows a secret on the terminal only, never on stdout, so a redirect cannot save it.
+    fn step(&mut self, _step: Step) -> Result<()> {
+        Ok(())
+    }
+    /// A key label, separate from its human-readable listing.
+    fn key_label(&mut self, _label: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Check cancellation before persistent changes or temporary volume attachments.
+    fn begin_work(&mut self, _message: &str) -> Result<()> {
+        Ok(())
+    }
+    /// A completed repair reached a stable state; later prompts may be cancelled again.
+    fn end_work(&mut self) -> Result<()> {
+        Ok(())
+    }
+    /// A warning that remains visible after a successful operation.
+    fn warn(&mut self, text: &str) {
+        self.say(text);
+    }
+    /// Shows a secret privately, never on stdout, so a redirect cannot save it.
     fn show_secret(&mut self, text: &str) -> Result<()>;
     /// A hidden answer, such as a password.
     fn secret(&mut self, prompt: &str) -> Result<Zeroizing<String>>;
@@ -17,9 +46,29 @@ pub trait Ui {
 
 pub struct Terminal;
 
+/// Escape data fields before interpolating them into messages with trusted line breaks.
+pub(crate) fn field(text: &str) -> String {
+    escape(text, false)
+}
+
+fn escape(text: &str, keep_layout: bool) -> String {
+    let mut safe = String::with_capacity(text.len());
+    for c in text.chars() {
+        if (c.is_control() && !(keep_layout && matches!(c, '\n' | '\t')))
+            || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            safe.extend(c.escape_debug());
+        } else {
+            safe.push(c);
+        }
+    }
+    safe
+}
+
 impl Ui for Terminal {
     fn say(&mut self, text: &str) {
-        println!("{text}");
+        // Keep application paragraphs, but never send terminal control sequences to the tty.
+        println!("{}", escape(text, true));
     }
 
     fn show_secret(&mut self, text: &str) -> Result<()> {

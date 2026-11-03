@@ -1,0 +1,5 @@
+module Backend {
+    header "include/Fido2VC.h"
+    link "fido2veracrypt"
+    export *
+}

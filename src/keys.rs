@@ -31,7 +31,10 @@ impl Keys for Fido {
     }
 
     fn unlock_key(&mut self, label: &str, salt: &[u8; 32], cred_id: &[u8]) -> Result<Unlock> {
-        eprintln!("Plug in the key labeled {label}, then press Enter.");
+        eprintln!(
+            "Plug in the key labeled {}, then press Enter.",
+            crate::ui::field(label)
+        );
         let mut line = String::new();
         std::io::stdin()
             .lock()

@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -33,10 +33,13 @@ enum Crash {
 #[derive(Default)]
 struct FakeVeraCrypt {
     containers: RefCell<BTreeMap<PathBuf, Container>>,
+    probes: Cell<usize>,
     crash: RefCell<Option<Crash>>,
     fail_create: bool,
     /// Fails after writing the container file, as a failed format on Linux does.
     fail_after_file: bool,
+    /// Creation succeeds but its temporary mount fails to close.
+    warn_create: bool,
     /// --force cannot close a busy volume, as on Linux.
     force_fails: bool,
 }
@@ -79,10 +82,13 @@ impl VeraCrypt for FakeVeraCrypt {
                 passphrase: passphrase.to_owned(),
                 hash: Some(HASH.to_owned()),
                 label: Some(label.to_owned()),
+                mounted: self.warn_create,
                 ..Container::default()
             },
         );
-        Ok(None)
+        Ok(self
+            .warn_create
+            .then(|| anyhow::anyhow!("The new container is still open")))
     }
 
     fn mount(&self, container: &Path, passphrase: &str, hash: Option<&str>) -> Result<Mount> {
@@ -96,6 +102,7 @@ impl VeraCrypt for FakeVeraCrypt {
     }
 
     fn opens(&self, container: &Path, passphrase: &str, hash: Option<&str>) -> Result<bool> {
+        self.probes.set(self.probes.get() + 1);
         Ok(Self::matches(&self.get(container), passphrase, hash))
     }
 
@@ -167,6 +174,7 @@ impl VeraCrypt for FakeVeraCrypt {
 #[derive(Default)]
 struct FakeKeys {
     plugged: Vec<u8>,
+    calls: usize,
 }
 
 fn output(id: u8, salt: &[u8; 32]) -> Zeroizing<[u8; 32]> {
@@ -175,6 +183,7 @@ fn output(id: u8, salt: &[u8; 32]) -> Zeroizing<[u8; 32]> {
 
 impl Keys for FakeKeys {
     fn unlock(&mut self, salt: &[u8; 32], cred_ids: &[&[u8]]) -> Result<Unlock> {
+        self.calls += 1;
         for &id in &self.plugged {
             if cred_ids.contains(&[id; 16].as_slice()) {
                 return Ok(Unlock {
@@ -187,6 +196,7 @@ impl Keys for FakeKeys {
     }
 
     fn unlock_key(&mut self, label: &str, salt: &[u8; 32], cred_id: &[u8]) -> Result<Unlock> {
+        self.calls += 1;
         match self.plugged.iter().find(|&&id| [id; 16] == cred_id) {
             Some(&id) => Ok(Unlock {
                 cred_id: vec![id; 16],
@@ -197,6 +207,7 @@ impl Keys for FakeKeys {
     }
 
     fn enroll(&mut self, salt: &[u8; 32], exclude: &[&[u8]]) -> Result<Enrollment> {
+        self.calls += 1;
         let id = *self
             .plugged
             .iter()
@@ -217,19 +228,29 @@ impl Keys for FakeKeys {
 /// group, or `wrong` when `confirm` is false.
 struct FakeUi {
     said: Vec<String>,
+    warnings: Vec<String>,
     /// What went to the terminal only.
     shown: Vec<String>,
     secrets: VecDeque<String>,
     confirm: bool,
+    cancel_work: bool,
+    cancel_after_repair: bool,
+    labels: Vec<String>,
+    steps: Vec<Step>,
 }
 
 impl Default for FakeUi {
     fn default() -> Self {
         Self {
             said: Vec::new(),
+            warnings: Vec::new(),
             shown: Vec::new(),
             secrets: VecDeque::new(),
             confirm: true,
+            cancel_work: false,
+            cancel_after_repair: false,
+            labels: Vec::new(),
+            steps: Vec::new(),
         }
     }
 }
@@ -248,8 +269,31 @@ impl FakeUi {
 }
 
 impl Ui for FakeUi {
+    fn step(&mut self, step: Step) -> Result<()> {
+        self.steps.push(step);
+        Ok(())
+    }
+    fn key_label(&mut self, label: &str) -> Result<()> {
+        self.labels.push(label.to_owned());
+        Ok(())
+    }
+
+    fn begin_work(&mut self, _: &str) -> Result<()> {
+        ensure!(!self.cancel_work, "Cancelled before changes");
+        Ok(())
+    }
+
+    fn end_work(&mut self) -> Result<()> {
+        ensure!(!self.cancel_after_repair, "Cancelled after repair");
+        Ok(())
+    }
     fn say(&mut self, text: &str) {
         self.said.push(text.to_owned());
+    }
+
+    fn warn(&mut self, text: &str) {
+        self.warnings.push(text.to_owned());
+        self.say(text);
     }
 
     fn show_secret(&mut self, text: &str) -> Result<()> {
@@ -285,7 +329,10 @@ impl World {
         Self {
             dir: tempfile::tempdir().unwrap(),
             vc: FakeVeraCrypt::default(),
-            keys: FakeKeys { plugged: vec![1] },
+            keys: FakeKeys {
+                plugged: vec![1],
+                ..FakeKeys::default()
+            },
             ui: FakeUi::default(),
         }
     }
@@ -331,6 +378,122 @@ fn error_of(result: Result<()>) -> String {
 }
 
 #[test]
+fn cancelling_before_work_preserves_the_container_and_slot() {
+    let mut world = World::new();
+    world.ui.cancel_work = true;
+    assert!(world.run("create DIR/a.hc --size 1M --label one").is_err());
+    assert!(!world.path("a.hc").exists());
+    assert!(!slots::path(&world.path("a.hc")).exists());
+    world.ui.cancel_work = false;
+    world.run("create DIR/a.hc --size 1M --label one").unwrap();
+    world.keys.plugged = vec![1, 2];
+    world.run("add-key DIR/a.hc --label two").unwrap();
+    let original = std::fs::read(slots::path(&world.path("a.hc"))).unwrap();
+    let passphrase = world.vc.get(&world.path("a.hc")).passphrase;
+    world.keys.plugged = vec![1, 2, 3];
+    world.ui.cancel_work = true;
+    for command in [
+        "add-key DIR/a.hc --label three",
+        "remove-key DIR/a.hc --label two",
+        "rotate DIR/a.hc",
+        "open DIR/a.hc",
+    ] {
+        assert!(world.run(command).is_err());
+        assert_eq!(
+            std::fs::read(slots::path(&world.path("a.hc"))).unwrap(),
+            original
+        );
+        let stored = world.vc.get(&world.path("a.hc"));
+        assert_eq!(stored.passphrase, passphrase);
+        assert!(!stored.mounted);
+    }
+}
+
+#[test]
+fn pending_repair_blocks_cancel_during_work_and_restores_it_before_later_prompts() {
+    let mut world = World::new();
+    world.run("create DIR/a.hc --size 1M --label one").unwrap();
+    *world.vc.crash.borrow_mut() = Some(Crash::BeforeHeader);
+    assert!(world.run("rotate DIR/a.hc").is_err());
+    *world.vc.crash.borrow_mut() = None;
+    let original = std::fs::read(slots::path(&world.path("a.hc"))).unwrap();
+    let probes = world.vc.probes.get();
+    world.ui.cancel_work = true;
+    assert!(world.run("open DIR/a.hc").is_err());
+    assert_eq!(world.vc.probes.get(), probes);
+    assert_eq!(
+        std::fs::read(slots::path(&world.path("a.hc"))).unwrap(),
+        original
+    );
+    world.ui.cancel_work = false;
+    world.ui.cancel_after_repair = true;
+    assert!(world.run("add-key DIR/a.hc --label two").is_err());
+    assert!(!world.slot("a.hc").has_pending(SECRET));
+    assert_eq!(world.slot("a.hc").keys().len(), 1);
+    assert_eq!(
+        world.vc.get(&world.path("a.hc")).passphrase,
+        world.stored("a.hc", 1)
+    );
+    assert!(!world.vc.get(&world.path("a.hc")).mounted);
+}
+
+#[test]
+fn key_listing_keeps_labels_separate_from_display_text() {
+    let mut world = World::new();
+    let label = "Backup key — café";
+    run(
+        Command::Create {
+            container: world.path("a.hc"),
+            size: 1 << 20,
+            label: label.into(),
+        },
+        &mut Tools {
+            vc: &world.vc,
+            keys: &mut world.keys,
+            ui: &mut world.ui,
+        },
+    )
+    .unwrap();
+    world.run("list-keys DIR/a.hc").unwrap();
+    assert_eq!(world.ui.labels, [label]);
+}
+
+#[test]
+fn removing_the_last_key_preserves_access_without_prompting() {
+    let mut world = World::new();
+    world.run("create DIR/a.hc --size 1M --label one").unwrap();
+    let original = std::fs::read(slots::path(&world.path("a.hc"))).unwrap();
+    let passphrase = world.vc.get(&world.path("a.hc")).passphrase;
+    let shown = world.ui.shown.len();
+    let calls = world.keys.calls;
+    assert!(world.run("remove-key DIR/a.hc --label one").is_err());
+    assert_eq!(world.keys.calls, calls);
+    assert_eq!(
+        std::fs::read(slots::path(&world.path("a.hc"))).unwrap(),
+        original
+    );
+    assert_eq!(world.ui.shown.len(), shown);
+    assert_eq!(world.vc.get(&world.path("a.hc")).passphrase, passphrase);
+    assert_eq!(world.stored("a.hc", 1), passphrase);
+}
+
+#[test]
+fn recovery_confirmation_precedes_the_wizards_write_step() {
+    let mut world = World::new();
+    world.ui.confirm = false;
+    assert!(world.run("create DIR/a.hc --size 1M --label one").is_err());
+    assert_eq!(world.ui.steps, [Step::Recovery]);
+    world.ui.steps.clear();
+    world.ui.confirm = true;
+    world.run("create DIR/a.hc --size 1M --label one").unwrap();
+    assert_eq!(world.ui.steps, [Step::Recovery, Step::Write]);
+    world.ui.steps.clear();
+    world.ui.confirm = false;
+    assert!(world.run("rotate DIR/a.hc").is_err());
+    assert_eq!(world.ui.steps, [Step::Recovery]);
+}
+
+#[test]
 fn create_makes_a_container_and_a_slot_file_that_opens_it() {
     let mut world = World::new();
     world
@@ -347,6 +510,21 @@ fn create_makes_a_container_and_a_slot_file_that_opens_it() {
         HASH
     );
     assert_eq!(vault.keys()[0].label, "yubikey");
+}
+
+#[test]
+fn successful_creation_preserves_a_warning_when_its_temporary_mount_stays_open() {
+    let mut world = World::new();
+    world.vc.warn_create = true;
+    world
+        .run("create DIR/secure.hc --size 1G --label key")
+        .unwrap();
+    assert_eq!(world.ui.warnings.len(), 1);
+    assert!(world.ui.warnings[0].contains("still open"));
+    assert!(world.vc.get(&world.path("secure.hc")).mounted);
+    assert_eq!(world.stored("secure.hc", 1), world.ui.shown_passphrase());
+    world.run("close DIR/secure.hc").unwrap();
+    assert!(!world.vc.get(&world.path("secure.hc")).mounted);
 }
 
 #[test]
@@ -687,4 +865,464 @@ fn a_volume_that_even_force_cannot_close_says_to_close_the_program() {
     let error = error_of(world.run("close DIR/a.hc --force"));
     assert!(!error.contains("run close --force"), "{error}");
     assert!(error.contains("fuser"), "{error}");
+}
+
+#[test]
+fn a_retry_that_changes_the_header_before_failing_preserves_a_matching_value() {
+    let mut world = World::new();
+    world.run("create DIR/a.hc --size 1G --label k").unwrap();
+    *world.vc.crash.borrow_mut() = Some(Crash::BeforeHeader);
+    assert!(world.run("rotate DIR/a.hc").is_err());
+    *world.vc.crash.borrow_mut() = Some(Crash::AfterHeader);
+    assert!(world.run("rotate DIR/a.hc").is_err());
+    let vault = world.slot("a.hc");
+    let unlock = Unlock {
+        cred_id: vec![1; 16],
+        output: output(1, &vault.salt()),
+    };
+    let pending = vault.open_pending(&[unlock], SECRET).unwrap().unwrap();
+    assert_eq!(
+        pending.as_slice(),
+        world.vc.get(&world.path("a.hc")).passphrase.as_bytes()
+    );
+    *world.vc.crash.borrow_mut() = None;
+    world.run("open DIR/a.hc").unwrap();
+    assert_eq!(
+        world.stored("a.hc", 1),
+        world.vc.get(&world.path("a.hc")).passphrase
+    );
+}
+
+#[test]
+fn unresolved_pending_state_blocks_new_rotations_and_key_changes() {
+    let mut world = World::new();
+    two_keys(&mut world);
+    *world.vc.crash.borrow_mut() = Some(Crash::BeforeHeader);
+    assert!(world.run("rotate DIR/a.hc").is_err());
+    let slot = slots::path(&world.path("a.hc"));
+    let before = std::fs::read(&slot).unwrap();
+    let printouts = world.ui.shown.len();
+    for command in [
+        "rotate DIR/a.hc",
+        "remove-key DIR/a.hc --label two",
+        "add-key DIR/a.hc --label three",
+    ] {
+        assert!(world.run(command).is_err());
+        assert_eq!(std::fs::read(&slot).unwrap(), before);
+        assert_eq!(world.ui.shown.len(), printouts);
+    }
+    world.run("open DIR/a.hc").unwrap();
+    assert!(world.vc.get(&world.path("a.hc")).mounted);
+}
+
+struct EnrollmentHook<'a> {
+    keys: FakeKeys,
+    hook: Box<dyn FnMut() + 'a>,
+}
+
+impl Keys for EnrollmentHook<'_> {
+    fn enroll(&mut self, salt: &[u8; 32], exclude: &[&[u8]]) -> Result<Enrollment> {
+        (self.hook)();
+        self.keys.enroll(salt, exclude)
+    }
+
+    fn unlock(&mut self, salt: &[u8; 32], ids: &[&[u8]]) -> Result<Unlock> {
+        self.keys.unlock(salt, ids)
+    }
+
+    fn unlock_key(&mut self, label: &str, salt: &[u8; 32], id: &[u8]) -> Result<Unlock> {
+        self.keys.unlock_key(label, salt, id)
+    }
+}
+
+#[test]
+fn recovery_excludes_a_competing_rotation_even_through_file_aliases() {
+    for alias in ["direct", "symlink", "hardlink"] {
+        let mut world = World::new();
+        world.run("create DIR/a.hc --size 1G --label one").unwrap();
+        let container = world.path("a.hc");
+        let other = match alias {
+            "symlink" => {
+                let other = world.path("alias.hc");
+                std::os::unix::fs::symlink(&container, &other).unwrap();
+                other
+            }
+            "hardlink" => {
+                let other = world.path("alias.hc");
+                std::fs::hard_link(&container, &other).unwrap();
+                other
+            }
+            _ => container.clone(),
+        };
+        // Both aliases would otherwise have enough metadata to start rotating the same header.
+        if other != container {
+            std::fs::copy(slots::path(&container), slots::path(&other)).unwrap();
+        }
+        let before = world.vc.get(&container).passphrase;
+        world.ui.secrets.push_back(before.clone());
+        let vc = &world.vc;
+        let mut keys = EnrollmentHook {
+            keys: FakeKeys {
+                plugged: vec![2],
+                ..FakeKeys::default()
+            },
+            hook: Box::new(|| {
+                let mut ui = FakeUi::default();
+                let result = run(
+                    Command::Rotate {
+                        container: other.clone(),
+                    },
+                    &mut Tools {
+                        vc,
+                        keys: &mut FakeKeys {
+                            plugged: vec![1],
+                            ..FakeKeys::default()
+                        },
+                        ui: &mut ui,
+                    },
+                );
+                assert!(error_of(result).contains("Another command"));
+                assert!(ui.shown.is_empty());
+            }),
+        };
+        run(
+            Command::AddKey {
+                container: container.clone(),
+                label: "two".into(),
+                recovery: true,
+            },
+            &mut Tools {
+                vc,
+                keys: &mut keys,
+                ui: &mut world.ui,
+            },
+        )
+        .unwrap();
+        drop(keys);
+        assert_eq!(world.stored("a.hc", 2), before);
+        world.keys.plugged = vec![2];
+        world.run("rotate DIR/a.hc").unwrap();
+        assert_eq!(world.stored("a.hc", 2), world.vc.get(&container).passphrase);
+    }
+}
+
+#[test]
+fn recovery_preserves_a_slot_changed_during_enrollment() {
+    let mut world = World::new();
+    world.run("create DIR/a.hc --size 1G --label one").unwrap();
+    let container = world.path("a.hc");
+    let slot = slots::path(&container);
+    let before = world.ui.shown_passphrase();
+    world.ui.secrets.push_back(before.clone());
+    let mut changed = world.slot("a.hc");
+    let unlock = Unlock {
+        cred_id: vec![1; 16],
+        output: output(1, &changed.salt()),
+    };
+    changed
+        .set_secret_meta(&[unlock], SECRET, "another-client", "saved")
+        .unwrap();
+    let vc = &world.vc;
+    let mut keys = EnrollmentHook {
+        keys: FakeKeys {
+            plugged: vec![2],
+            ..FakeKeys::default()
+        },
+        hook: Box::new(|| changed.save(&slot, false).unwrap()),
+    };
+    assert!(
+        run(
+            Command::AddKey {
+                container: container.clone(),
+                label: "two".into(),
+                recovery: true
+            },
+            &mut Tools {
+                vc,
+                keys: &mut keys,
+                ui: &mut world.ui
+            }
+        )
+        .is_err()
+    );
+    drop(keys);
+    assert_eq!(
+        world.slot("a.hc").secret_meta(SECRET).unwrap()["another-client"],
+        "saved"
+    );
+    assert_eq!(world.stored("a.hc", 1), before);
+    world.run("open DIR/a.hc").unwrap();
+}
+
+#[test]
+fn recovery_rechecks_the_header_after_enrollment() {
+    let mut world = World::new();
+    world.run("create DIR/a.hc --size 1G --label one").unwrap();
+    let container = world.path("a.hc");
+    let slot = slots::path(&container);
+    let before = std::fs::read(&slot).unwrap();
+    world.ui.secrets.push_back(world.ui.shown_passphrase());
+    let vc = &world.vc;
+    let mut keys = EnrollmentHook {
+        keys: FakeKeys {
+            plugged: vec![2],
+            ..FakeKeys::default()
+        },
+        hook: Box::new(|| {
+            vc.containers
+                .borrow_mut()
+                .get_mut(&container)
+                .unwrap()
+                .passphrase = "external change".into()
+        }),
+    };
+    assert!(
+        run(
+            Command::AddKey {
+                container: container.clone(),
+                label: "two".into(),
+                recovery: true
+            },
+            &mut Tools {
+                vc,
+                keys: &mut keys,
+                ui: &mut world.ui
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(&slot).unwrap(), before);
+}
+
+#[test]
+fn recovery_keeps_distinct_backups_for_successive_replacements() {
+    let mut world = World::new();
+    world.run("create DIR/a.hc --size 1G --label one").unwrap();
+    let slot = slots::path(&world.path("a.hc"));
+    let mut originals = Vec::new();
+    for (key, label) in [(2, "two"), (3, "three")] {
+        originals.push(std::fs::read(&slot).unwrap());
+        world.keys.plugged = vec![key];
+        world.ui.secrets.push_back(world.ui.shown_passphrase());
+        world
+            .run(&format!("add-key DIR/a.hc --label {label} --recovery"))
+            .unwrap();
+    }
+    let mut backups: Vec<_> = std::fs::read_dir(world.path(""))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.to_string_lossy().contains(".replaced-"))
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    backups.sort();
+    originals.sort();
+    assert_eq!(backups, originals);
+    world.run("open DIR/a.hc").unwrap();
+}
+
+#[test]
+fn close_uses_the_attachment_after_its_source_directory_moves() {
+    let mut world = World::new();
+    world.run("create DIR/a.hc --size 1G --label one").unwrap();
+    world.run("open DIR/a.hc").unwrap();
+    let container = world.path("a.hc");
+    let moved = tempfile::tempdir().unwrap();
+    std::fs::rename(world.dir.path(), moved.path().join("moved")).unwrap();
+    for command in [
+        Command::Close {
+            container: None,
+            force: false,
+        },
+        Command::Status { container: None },
+    ] {
+        assert!(
+            run(
+                command,
+                &mut Tools {
+                    vc: &world.vc,
+                    keys: &mut world.keys,
+                    ui: &mut world.ui
+                }
+            )
+            .is_err()
+        );
+        assert!(world.vc.get(&container).mounted);
+    }
+    run(
+        Command::Close {
+            container: Some(container.clone()),
+            force: false,
+        },
+        &mut Tools {
+            vc: &world.vc,
+            keys: &mut world.keys,
+            ui: &mut world.ui,
+        },
+    )
+    .unwrap();
+    assert!(!world.vc.get(&container).mounted);
+}
+
+#[test]
+fn open_and_close_work_without_writable_lock_storage() {
+    use std::os::unix::fs::PermissionsExt;
+    for keep_lock in [false, true] {
+        let mut world = World::new();
+        world.run("create DIR/a.hc --size 1G --label one").unwrap();
+        let container = world.path("a.hc");
+        let lock = world.path("a.hc.fido2veracrypt_lock");
+        if keep_lock {
+            std::fs::set_permissions(lock, std::fs::Permissions::from_mode(0o400)).unwrap();
+        } else {
+            std::fs::remove_file(lock).unwrap();
+        }
+        std::fs::set_permissions(world.dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let opened = world.run("open DIR/a.hc");
+        let closed = world.run("close DIR/a.hc");
+        std::fs::set_permissions(world.dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        opened.unwrap();
+        closed.unwrap();
+        assert!(!world.vc.get(&container).mounted);
+    }
+}
+
+#[test]
+fn nonregular_storage_is_rejected_before_any_prompt() {
+    for target in ["container", "lock", "slot"] {
+        let mut world = World::new();
+        let container = world.path("a.hc");
+        let (fifo, command) = match target {
+            "container" => (
+                container.clone(),
+                Command::Open {
+                    container: container.clone(),
+                },
+            ),
+            "lock" => (
+                world.path("a.hc.fido2veracrypt_lock"),
+                Command::Create {
+                    container: container.clone(),
+                    size: 1 << 20,
+                    label: "key".into(),
+                },
+            ),
+            _ => {
+                world.run("create DIR/a.hc --size 1G --label key").unwrap();
+                let slot = slots::path(&container);
+                std::fs::remove_file(&slot).unwrap();
+                (
+                    slot,
+                    Command::AddKey {
+                        container: container.clone(),
+                        label: "replacement".into(),
+                        recovery: true,
+                    },
+                )
+            }
+        };
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        world.keys.plugged.clear();
+        world.ui.shown.clear();
+        assert!(
+            run(
+                command,
+                &mut Tools {
+                    vc: &world.vc,
+                    keys: &mut world.keys,
+                    ui: &mut world.ui
+                }
+            )
+            .is_err()
+        );
+        assert!(world.ui.shown.is_empty());
+    }
+}
+
+#[test]
+fn oversized_labels_and_line_break_paths_do_not_reach_enrollment() {
+    let mut world = World::new();
+    world.keys.plugged.clear(); // Fake enrollment panics if the command reaches it.
+    let container = world.path("a.hc");
+    for (path, label) in [
+        (container.clone(), "a".repeat(257)),
+        (world.path("a.hc\n"), "key".into()),
+        (world.path("a.hc\r"), "key".into()),
+    ] {
+        assert!(
+            run(
+                Command::Create {
+                    container: path.clone(),
+                    size: 1 << 20,
+                    label
+                },
+                &mut Tools {
+                    vc: &world.vc,
+                    keys: &mut world.keys,
+                    ui: &mut world.ui
+                }
+            )
+            .is_err()
+        );
+        assert!(!path.exists());
+        assert!(!slots::path(&path).exists());
+    }
+    world.keys.plugged.push(1);
+    let label = "é".repeat(128);
+    run(
+        Command::Create {
+            container: container.clone(),
+            size: 1 << 20,
+            label: label.clone(),
+        },
+        &mut Tools {
+            vc: &world.vc,
+            keys: &mut world.keys,
+            ui: &mut world.ui,
+        },
+    )
+    .unwrap();
+    assert_eq!(world.slot("a.hc").keys()[0].label, label);
+}
+
+#[test]
+fn unverified_fields_escape_controls_and_keep_readable_unicode() {
+    let mut world = World::new();
+    let label = "café\u{1b}[clear]\r\nspoof";
+    run(
+        Command::Create {
+            container: world.path("a.hc"),
+            size: 1 << 20,
+            label: label.into(),
+        },
+        &mut Tools {
+            vc: &world.vc,
+            keys: &mut world.keys,
+            ui: &mut world.ui,
+        },
+    )
+    .unwrap();
+    let mut vault = world.slot("a.hc");
+    let unlock = Unlock {
+        cred_id: vec![1; 16],
+        output: output(1, &vault.salt()),
+    };
+    vault
+        .set_secret_meta(&[unlock], SECRET, HASH_META, "Argon2\u{1b}[clear]")
+        .unwrap();
+    vault
+        .save(&slots::path(&world.path("a.hc")), false)
+        .unwrap();
+    world.ui.said.clear();
+    world.run("status DIR/a.hc").unwrap();
+    world.run("list-keys DIR/a.hc").unwrap();
+    let output = world.ui.output();
+    assert!(!output.contains(['\u{1b}', '\r']));
+    assert!(output.contains("café\\u{1b}[clear]\\r\\nspoof"));
+    assert!(output.contains("Argon2\\u{1b}[clear]"));
 }
