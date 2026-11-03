@@ -9,26 +9,31 @@ fido2veracrypt opens VeraCrypt containers with a FIDO2 security key.
 
 Usage: fido2veracrypt <command> [options]
 
-Commands:
-  create <container> --size <size> --label <label>
-      Make a container and enroll the plugged-in key under <label>.
-  adopt <container> --label <label>
-      Enroll a key for an existing container and give it a new passphrase.
+Containers:
+  create <container> --size <size> --label <name>
+      Create a container, enroll your key, and save the recovery phrase.
+  adopt <container> --label <name>
+      Add key access to an existing VeraCrypt container and set a new recovery phrase.
   open <container>
-      Unlock and mount a container.
+      Open a container with an enrolled key.
   close [<container>] [--force]
-      Unmount a container, or every open one. On macOS, --force closes it even with files
-      open, and unsaved changes in them are lost.
-  add-key <container> --label <label> [--recovery]
-      Enroll another key. --recovery uses the recovery passphrase and rebuilds the slot file.
-  remove-key <container> --label <label>...
-      Remove lost or stolen keys and change the passphrase.
-  rotate <container>
-      Change the passphrase and show the new one.
+      Close one container, or every open one. On macOS, --force can lose unsaved changes.
   status [<container>]
-      Show the open volumes, or one container's keys and state.
+      Show open containers, or one container's keys and state.
+
+Keys:
   list-keys <container>
-      List the enrolled keys.
+      Show the enrolled keys.
+  add-key <container> --label <name> [--recovery]
+      Use an existing key, then connect and enroll the new key.
+      --recovery restores key access with the recovery phrase and replaces the key list.
+  remove-key <container> --label <name>...
+      Use every key you keep, remove the selected keys, and save a new recovery phrase.
+      At least one key must remain.
+  rotate <container>
+      Change the recovery phrase. All enrolled keys still work.
+
+Other:
   completions zsh|bash
       Print the shell completion script.
   help

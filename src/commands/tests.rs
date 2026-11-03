@@ -235,6 +235,7 @@ struct FakeUi {
     confirm: bool,
     cancel_work: bool,
     cancel_after_repair: bool,
+    cancel_connect: bool,
     labels: Vec<String>,
     steps: Vec<Step>,
 }
@@ -249,6 +250,7 @@ impl Default for FakeUi {
             confirm: true,
             cancel_work: false,
             cancel_after_repair: false,
+            cancel_connect: false,
             labels: Vec::new(),
             steps: Vec::new(),
         }
@@ -271,6 +273,10 @@ impl FakeUi {
 impl Ui for FakeUi {
     fn step(&mut self, step: Step) -> Result<()> {
         self.steps.push(step);
+        Ok(())
+    }
+    fn connect_key(&mut self, _: &str) -> Result<()> {
+        ensure!(!self.cancel_connect, "Cancelled before connecting a key");
         Ok(())
     }
     fn key_label(&mut self, label: &str) -> Result<()> {
@@ -482,15 +488,118 @@ fn recovery_confirmation_precedes_the_wizards_write_step() {
     let mut world = World::new();
     world.ui.confirm = false;
     assert!(world.run("create DIR/a.hc --size 1M --label one").is_err());
-    assert_eq!(world.ui.steps, [Step::Recovery]);
+    assert_eq!(world.ui.steps, [Step::Enroll, Step::Recovery]);
     world.ui.steps.clear();
     world.ui.confirm = true;
     world.run("create DIR/a.hc --size 1M --label one").unwrap();
-    assert_eq!(world.ui.steps, [Step::Recovery, Step::Write]);
+    assert_eq!(world.ui.steps, [Step::Enroll, Step::Recovery, Step::Write]);
     world.ui.steps.clear();
     world.ui.confirm = false;
     assert!(world.run("rotate DIR/a.hc").is_err());
-    assert_eq!(world.ui.steps, [Step::Recovery]);
+    assert_eq!(world.ui.steps, [Step::Authenticate, Step::Recovery]);
+}
+
+#[test]
+fn key_changes_refuse_open_containers_before_authentication() {
+    for half_closed in [false, true] {
+        let mut world = World::new();
+        two_keys(&mut world);
+        world.keys.plugged.push(3);
+        world.run("open DIR/a.hc").unwrap();
+        world
+            .vc
+            .containers
+            .borrow_mut()
+            .get_mut(&world.path("a.hc"))
+            .unwrap()
+            .half_closed = half_closed;
+        let slot = slots::path(&world.path("a.hc"));
+        let before = std::fs::read(&slot).unwrap();
+        let passphrase = world.vc.get(&world.path("a.hc")).passphrase;
+        let calls = world.keys.calls;
+        let shown = world.ui.shown.len();
+        for command in [
+            "add-key DIR/a.hc --label three",
+            "remove-key DIR/a.hc --label two",
+            "rotate DIR/a.hc",
+            "add-key DIR/a.hc --label three --recovery",
+        ] {
+            assert!(world.run(command).is_err(), "{command}");
+            assert_eq!(world.keys.calls, calls);
+            assert_eq!(world.ui.shown.len(), shown);
+            assert_eq!(std::fs::read(&slot).unwrap(), before);
+            assert_eq!(world.vc.get(&world.path("a.hc")).passphrase, passphrase);
+        }
+    }
+}
+
+#[test]
+fn a_late_hard_link_attachment_preserves_keys_and_the_header() {
+    let mut world = World::new();
+    world.run("create DIR/a.hc --size 1M --label one").unwrap();
+    let container = world.path("a.hc");
+    let alias = world.path("alias.hc");
+    std::fs::hard_link(&container, &alias).unwrap();
+    let before = std::fs::read(slots::path(&container)).unwrap();
+    let passphrase = world.vc.get(&container).passphrase;
+    let vc = &world.vc;
+    let mut keys = EnrollmentHook {
+        keys: FakeKeys {
+            plugged: vec![1, 2],
+            ..FakeKeys::default()
+        },
+        hook: Box::new(|| {
+            let mut attached = vc.get(&container);
+            attached.mounted = true;
+            vc.containers.borrow_mut().insert(alias.clone(), attached);
+        }),
+    };
+    assert!(
+        run(
+            Command::AddKey {
+                container: container.clone(),
+                label: "two".into(),
+                recovery: false
+            },
+            &mut Tools {
+                vc,
+                keys: &mut keys,
+                ui: &mut world.ui
+            },
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(slots::path(&container)).unwrap(), before);
+    assert_eq!(vc.get(&container).passphrase, passphrase);
+}
+
+#[test]
+fn an_unknown_attachment_blocks_changes_but_another_container_does_not() {
+    let mut world = World::new();
+    world.run("create DIR/a.hc --size 1M --label one").unwrap();
+    world.keys.plugged.push(2);
+    let unknown = world.path("unknown.hc");
+    world.vc.containers.borrow_mut().insert(
+        unknown.clone(),
+        Container {
+            mounted: true,
+            ..Container::default()
+        },
+    );
+    let calls = world.keys.calls;
+    let before = std::fs::read(slots::path(&world.path("a.hc"))).unwrap();
+    assert!(world.run("add-key DIR/a.hc --label two").is_err());
+    assert_eq!(world.keys.calls, calls);
+    assert_eq!(
+        std::fs::read(slots::path(&world.path("a.hc"))).unwrap(),
+        before
+    );
+    std::fs::write(&unknown, b"different container").unwrap();
+    world.run("add-key DIR/a.hc --label two").unwrap();
+    assert_eq!(
+        world.stored("a.hc", 2),
+        world.vc.get(&world.path("a.hc")).passphrase
+    );
 }
 
 #[test]
@@ -686,6 +795,117 @@ fn add_key_enrolls_a_second_key_without_changing_the_passphrase() {
     let shown = world.ui.shown_passphrase();
     assert_eq!(world.stored("a.hc", 2), shown);
     assert_eq!(world.vc.get(&world.path("a.hc")).passphrase, shown);
+}
+
+#[test]
+fn adding_a_key_waits_for_connection_and_keeps_access_on_cancel() {
+    let mut world = World::new();
+    world.run("create DIR/a.hc --size 1M --label one").unwrap();
+    world.keys.plugged.push(2);
+    let before = std::fs::read(slots::path(&world.path("a.hc"))).unwrap();
+    let passphrase = world.vc.get(&world.path("a.hc")).passphrase;
+    let calls = world.keys.calls;
+    world.ui.steps.clear();
+    world.ui.cancel_connect = true;
+    assert!(world.run("add-key DIR/a.hc --label two").is_err());
+    assert_eq!(world.keys.calls, calls + 1);
+    assert_eq!(world.ui.steps, [Step::Authenticate, Step::Connect]);
+    assert_eq!(
+        std::fs::read(slots::path(&world.path("a.hc"))).unwrap(),
+        before
+    );
+    assert_eq!(world.vc.get(&world.path("a.hc")).passphrase, passphrase);
+    world.ui.cancel_connect = false;
+    world.ui.steps.clear();
+    world.run("add-key DIR/a.hc --label two").unwrap();
+    assert_eq!(
+        world.ui.steps,
+        [Step::Authenticate, Step::Connect, Step::Enroll, Step::Write]
+    );
+    assert_eq!(world.stored("a.hc", 1), passphrase);
+    assert_eq!(world.stored("a.hc", 2), passphrase);
+}
+
+#[test]
+fn cancelling_a_retained_key_connection_preserves_all_keys() {
+    let mut world = World::new();
+    two_keys(&mut world);
+    world.keys.plugged.push(3);
+    world.run("add-key DIR/a.hc --label three").unwrap();
+    let before = std::fs::read(slots::path(&world.path("a.hc"))).unwrap();
+    let passphrase = world.vc.get(&world.path("a.hc")).passphrase;
+    let calls = world.keys.calls;
+    let shown = world.ui.shown.len();
+    world.ui.steps.clear();
+    world.ui.cancel_connect = true;
+    assert!(world.run("remove-key DIR/a.hc --label three").is_err());
+    assert_eq!(world.keys.calls, calls + 1);
+    assert_eq!(world.ui.steps, [Step::Authenticate]);
+    assert_eq!(world.ui.shown.len(), shown);
+    assert_eq!(
+        std::fs::read(slots::path(&world.path("a.hc"))).unwrap(),
+        before
+    );
+    assert_eq!(world.vc.get(&world.path("a.hc")).passphrase, passphrase);
+}
+
+#[test]
+fn cancelling_password_checks_stops_before_temporary_attachments() {
+    let mut world = World::new();
+    world.run("create DIR/a.hc --size 1M --label one").unwrap();
+    let before = std::fs::read(slots::path(&world.path("a.hc"))).unwrap();
+    let passphrase = world.vc.get(&world.path("a.hc")).passphrase;
+    let calls = world.keys.calls;
+    world.ui.secrets.push_back(passphrase.clone());
+    world.ui.cancel_work = true;
+    assert!(
+        world
+            .run("add-key DIR/a.hc --label two --recovery")
+            .is_err()
+    );
+    assert_eq!(world.vc.probes.get(), 0);
+    assert_eq!(world.keys.calls, calls);
+    assert_eq!(
+        std::fs::read(slots::path(&world.path("a.hc"))).unwrap(),
+        before
+    );
+    assert_eq!(world.vc.get(&world.path("a.hc")).passphrase, passphrase);
+    existing(&world, "old.hc");
+    let old = world.vc.get(&world.path("old.hc")).passphrase;
+    world.ui.secrets.push_back(old.clone());
+    assert!(world.run("adopt DIR/old.hc --label one").is_err());
+    assert_eq!(world.vc.probes.get(), 0);
+    assert_eq!(world.keys.calls, calls);
+    assert_eq!(world.vc.get(&world.path("old.hc")).passphrase, old);
+    assert!(!slots::path(&world.path("old.hc")).exists());
+}
+
+#[test]
+fn pending_repair_requires_a_closed_container_before_probing() {
+    let mut world = World::new();
+    world.run("create DIR/a.hc --size 1M --label one").unwrap();
+    *world.vc.crash.borrow_mut() = Some(Crash::BeforeHeader);
+    assert!(world.run("rotate DIR/a.hc").is_err());
+    *world.vc.crash.borrow_mut() = None;
+    world
+        .vc
+        .containers
+        .borrow_mut()
+        .get_mut(&world.path("a.hc"))
+        .unwrap()
+        .mounted = true;
+    let slot = slots::path(&world.path("a.hc"));
+    let before = std::fs::read(&slot).unwrap();
+    let probes = world.vc.probes.get();
+    let passphrase = world.vc.get(&world.path("a.hc")).passphrase;
+    assert!(world.run("open DIR/a.hc").is_err());
+    assert_eq!(world.vc.probes.get(), probes);
+    assert_eq!(std::fs::read(&slot).unwrap(), before);
+    assert_eq!(world.vc.get(&world.path("a.hc")).passphrase, passphrase);
+    world.run("close DIR/a.hc").unwrap();
+    world.run("open DIR/a.hc").unwrap();
+    assert!(!world.slot("a.hc").has_pending(SECRET));
+    assert!(world.vc.get(&world.path("a.hc")).mounted);
 }
 
 #[test]

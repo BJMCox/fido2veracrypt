@@ -32,14 +32,14 @@ impl Passphrase {
                     'O' => Ok(b'0'),
                     c if c.is_ascii() && ALPHABET.contains(&(c as u8)) => Ok(c as u8),
                     _ => Err(anyhow!(
-                        "The recovery passphrase holds a character that is not on the printout"
+                        "The recovery phrase contains an unsupported character"
                     )),
                 })
                 .collect::<Result<Vec<u8>>>()?,
         );
         ensure!(
             symbols.len() == SYMBOLS,
-            "The recovery passphrase has {SYMBOLS} characters besides the dashes, and {} were typed",
+            "The recovery phrase needs {SYMBOLS} characters besides the dashes. You entered {}",
             symbols.len()
         );
         Ok(Self::from_symbols(symbols.iter().copied()))
