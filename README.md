@@ -66,31 +66,40 @@ Run the Swift workflow tests after building the Rust library with `swift test --
 
 ## CLI usage
 
+The CLI uses direct commands with numbered steps for creation and key changes. Add Key first asks for an existing key, then waits while you connect the new key. Remove Key asks for the keys you keep. Open and Close use short prompts.
+
+Close the container before changing its keys or recovery phrase. The CLI and Mac app share this rule and check again before writing. Both refuse to remove the last key.
+
 ```text
 fido2veracrypt opens VeraCrypt containers with a FIDO2 security key.
 
 Usage: fido2veracrypt <command> [options]
 
-Commands:
-  create <container> --size <size> --label <label>
-      Make a container and enroll the plugged-in key under <label>.
-  adopt <container> --label <label>
-      Enroll a key for an existing container and give it a new passphrase.
+Containers:
+  create <container> --size <size> --label <name>
+      Create a container, enroll your key, and save the recovery phrase.
+  adopt <container> --label <name>
+      Add key access to an existing VeraCrypt container and set a new recovery phrase.
   open <container>
-      Unlock and mount a container.
+      Open a container with an enrolled key.
   close [<container>] [--force]
-      Unmount a container, or every open one. On macOS, --force closes it even with files
-      open, and unsaved changes in them are lost.
-  add-key <container> --label <label> [--recovery]
-      Enroll another key. --recovery uses the recovery passphrase and rebuilds the slot file.
-  remove-key <container> --label <label>...
-      Remove lost or stolen keys and change the passphrase.
-  rotate <container>
-      Change the passphrase and show the new one.
+      Close one container, or every open one. On macOS, --force can lose unsaved changes.
   status [<container>]
-      Show the open volumes, or one container's keys and state.
+      Show open containers, or one container's keys and state.
+
+Keys:
   list-keys <container>
-      List the enrolled keys.
+      Show the enrolled keys.
+  add-key <container> --label <name> [--recovery]
+      Use an existing key, then connect and enroll the new key.
+      --recovery restores key access with the recovery phrase and replaces the key list.
+  remove-key <container> --label <name>...
+      Use every key you keep, remove the selected keys, and save a new recovery phrase.
+      At least one key must remain.
+  rotate <container>
+      Change the recovery phrase. All enrolled keys still work.
+
+Other:
   completions zsh|bash
       Print the shell completion script.
   help
@@ -107,9 +116,9 @@ Container paths must be UTF-8 and cannot contain NUL or line breaks. Key names t
 
 With several keys plugged in, all of them blink: touch the one to use. Then enter its PIN and touch it again. With one key, the first touch is skipped.
 
-### The recovery passphrase
+### The recovery phrase
 
-`create`, `adopt`, `rotate`, and `remove-key` show a new recovery passphrase on the terminal: 52 characters in groups of 4. It never goes to stdout, so a redirect cannot save it. Write it down, keep it away from the drive, and type its last group back when asked. The new passphrase is not written until you confirm it.
+`create`, `adopt`, `rotate`, and `remove-key` show a new recovery phrase on the terminal: 52 characters in groups of 4. It never goes to stdout, so a redirect cannot save it. Save it away from the drive and enter its last group when asked. The new phrase is not written until you confirm it.
 
 To open the container without fido2veracrypt, give VeraCrypt the passphrase exactly as printed, dashes included. If every key is lost or the slot file is gone, `add-key --recovery` enrolls a key again from the printout.
 

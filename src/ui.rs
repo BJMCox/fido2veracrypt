@@ -2,8 +2,10 @@
 
 use std::io::{BufRead, Write};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use zeroize::Zeroizing;
+
+use crate::cli::Command;
 
 /// A visible step in a multi-stage operation. This does not change cancellation policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,6 +20,11 @@ pub enum Step {
 pub trait Ui {
     fn say(&mut self, text: &str);
     fn step(&mut self, _step: Step) -> Result<()> {
+        Ok(())
+    }
+    /// Wait for the owner to connect the requested key before accessing devices.
+    fn connect_key(&mut self, prompt: &str) -> Result<()> {
+        self.ask(&format!("{prompt} Press Enter to continue: "))?;
         Ok(())
     }
     /// A key label, separate from its human-readable listing.
@@ -44,7 +51,54 @@ pub trait Ui {
     fn ask(&mut self, prompt: &str) -> Result<String>;
 }
 
-pub struct Terminal;
+pub struct Terminal {
+    steps: &'static [(Step, &'static str)],
+}
+
+impl Terminal {
+    pub fn new(command: &Command) -> Self {
+        use Step::*;
+        let steps: &[_] = match command {
+            Command::Create { .. } => &[
+                (Enroll, "Enroll your key"),
+                (Recovery, "Save the recovery phrase"),
+                (Write, "Create the container"),
+            ],
+            Command::Adopt { .. } => &[
+                (Authenticate, "Enter the container's current password"),
+                (Enroll, "Enroll your key"),
+                (Recovery, "Save the new recovery phrase"),
+                (Write, "Add key access to the container"),
+            ],
+            Command::AddKey {
+                recovery: false, ..
+            } => &[
+                (Authenticate, "Use an existing key"),
+                (Connect, "Connect the new key"),
+                (Enroll, "Enroll the new key"),
+                (Write, "Save the new key"),
+            ],
+            Command::AddKey { recovery: true, .. } => &[
+                (Authenticate, "Enter the recovery phrase"),
+                (Connect, "Connect the new key"),
+                (Enroll, "Enroll the new key"),
+                (Write, "Restore key access"),
+            ],
+            Command::RemoveKey { .. } => &[
+                (Authenticate, "Use the keys you're keeping"),
+                (Recovery, "Save the new recovery phrase"),
+                (Write, "Remove the selected keys"),
+            ],
+            Command::Rotate { .. } => &[
+                (Authenticate, "Use an existing key"),
+                (Recovery, "Save the new recovery phrase"),
+                (Write, "Change the recovery phrase"),
+            ],
+            _ => &[],
+        };
+        Self { steps }
+    }
+}
 
 /// Escape data fields before interpolating them into messages with trusted line breaks.
 pub(crate) fn field(text: &str) -> String {
@@ -66,16 +120,34 @@ fn escape(text: &str, keep_layout: bool) -> String {
 }
 
 impl Ui for Terminal {
+    fn step(&mut self, step: Step) -> Result<()> {
+        if let Some(index) = self.steps.iter().position(|(value, _)| *value == step) {
+            eprintln!(
+                "\n[{}/{}] {}",
+                index + 1,
+                self.steps.len(),
+                self.steps[index].1
+            );
+        }
+        Ok(())
+    }
+
+    fn begin_work(&mut self, message: &str) -> Result<()> {
+        eprintln!("{}", escape(message, true));
+        Ok(())
+    }
+
     fn say(&mut self, text: &str) {
         // Keep application paragraphs, but never send terminal control sequences to the tty.
         println!("{}", escape(text, true));
     }
 
     fn show_secret(&mut self, text: &str) -> Result<()> {
+        std::io::stdout().flush()?;
         let mut tty = std::fs::OpenOptions::new()
             .write(true)
             .open("/dev/tty")
-            .context("The recovery passphrase is shown only on a terminal. Run this from one.")?;
+            .context("The recovery phrase is shown only on a terminal. Run this from one.")?;
         writeln!(tty, "\n{text}\n")?;
         Ok(())
     }
@@ -90,7 +162,10 @@ impl Ui for Terminal {
         print!("{prompt}");
         std::io::stdout().flush()?;
         let mut line = String::new();
-        std::io::stdin().lock().read_line(&mut line)?;
+        ensure!(
+            std::io::stdin().lock().read_line(&mut line)? > 0,
+            "Input ended before confirmation."
+        );
         Ok(line.trim().to_owned())
     }
 }

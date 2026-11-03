@@ -2,6 +2,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -59,6 +60,13 @@ pub struct Tools<'a> {
     pub ui: &'a mut dyn Ui,
 }
 
+impl Tools<'_> {
+    fn begin_change(&mut self, container: &Path, message: &str) -> Result<()> {
+        require_closed(self.vc, container)?;
+        self.ui.begin_work(message)
+    }
+}
+
 /// A slot file unlocked with keys whose outputs the vault's tag check accepted.
 struct Unlocked {
     slot: PathBuf,
@@ -85,7 +93,7 @@ pub fn run(command: Command, t: &mut Tools) -> Result<()> {
             label,
         } => transaction(&container, |container| create(t, container, size, &label)),
         Command::Adopt { container, label } => {
-            transaction(&container, |container| adopt(t, container, &label))
+            change_transaction(t, &container, |t, container| adopt(t, container, &label))
         }
         Command::Open { container } => transaction(&container, |container| open(t, container)),
         Command::Close { container, force } => close(t, container, force),
@@ -93,18 +101,20 @@ pub fn run(command: Command, t: &mut Tools) -> Result<()> {
             container,
             label,
             recovery: false,
-        } => transaction(&container, |container| add_key(t, container, &label)),
+        } => change_transaction(t, &container, |t, container| add_key(t, container, &label)),
         Command::AddKey {
             container,
             label,
             recovery: true,
-        } => transaction(&container, |container| {
+        } => change_transaction(t, &container, |t, container| {
             add_key_with_recovery(t, container, &label)
         }),
         Command::RemoveKey { container, labels } => {
-            transaction(&container, |container| remove_key(t, container, &labels))
+            change_transaction(t, &container, |t, container| {
+                remove_key(t, container, &labels)
+            })
         }
-        Command::Rotate { container } => transaction(&container, |container| rotate(t, container)),
+        Command::Rotate { container } => change_transaction(t, &container, rotate),
         Command::Status { container } => status(t, container.as_deref().map(resolve).transpose()?),
         Command::ListKeys { container } => list_keys(t, &resolve(&container)?),
         Command::Completions { shell } => {
@@ -219,6 +229,32 @@ fn transaction(container: &Path, action: impl FnOnce(&Path) -> Result<()>) -> Re
     action(&container)
 }
 
+fn change_transaction(
+    t: &mut Tools,
+    container: &Path,
+    action: impl FnOnce(&mut Tools, &Path) -> Result<()>,
+) -> Result<()> {
+    transaction(container, |container| {
+        require_closed(t.vc, container)?;
+        action(t, container)
+    })
+}
+
+fn require_closed(vc: &dyn VeraCrypt, container: &Path) -> Result<()> {
+    let source = container.metadata().context("Cannot find the container")?;
+    for volume in vc.list()? {
+        let attached = volume
+            .container
+            .metadata()
+            .context("An attached container is unavailable. Close it before changing keys or the recovery phrase.")?;
+        ensure!(
+            (source.dev(), source.ino()) != (attached.dev(), attached.ino()),
+            "Close the container before changing its keys or recovery phrase."
+        );
+    }
+    Ok(())
+}
+
 fn create(t: &mut Tools, container: &Path, size: u64, label: &str) -> Result<()> {
     let slot = slots::path(container);
     ensure!(
@@ -232,7 +268,7 @@ fn create(t: &mut Tools, container: &Path, size: u64, label: &str) -> Result<()>
         slot.display()
     );
     let salt = Vault::new_salt()?;
-    t.ui.say("Enroll the key that will open this container.");
+    t.ui.step(Step::Enroll)?;
     let enrollment = t.keys.enroll(&salt, &[])?;
     let passphrase = Passphrase::generate()?;
     show_recovery(t.ui, &passphrase)?;
@@ -274,11 +310,7 @@ fn create(t: &mut Tools, container: &Path, size: u64, label: &str) -> Result<()>
         )),
         Ok(None) => {}
     }
-    t.ui.say(&format!(
-        "Created {}. Open it with: fido2veracrypt open {}",
-        container.display(),
-        container.display()
-    ));
+    t.ui.say(&format!("Created {}.", container.display()));
     Ok(())
 }
 
@@ -294,19 +326,24 @@ fn adopt(t: &mut Tools, container: &Path, label: &str) -> Result<()> {
         "{} already has a slot file. Use add-key to enroll another key.",
         container.display()
     );
+    t.ui.step(Step::Authenticate)?;
     let old = t.ui.secret("The container's current password: ")?;
+    t.begin_change(container, "Checking the current password…")?;
     ensure!(
         t.vc.opens(container, &old, None)?,
         "That password does not open the container. Nothing was changed."
     );
+    t.ui.end_work()?;
     t.ui.say(
         "The old password still opens any copy of this container made before now, such as a backup. Only a new container with the files copied over removes that.",
     );
     let salt = Vault::new_salt()?;
-    t.ui.say("Enroll the key that will open this container.");
+    t.ui.step(Step::Enroll)?;
     let enrollment = t.keys.enroll(&salt, &[])?;
     let new = Passphrase::generate()?;
     show_recovery(t.ui, &new)?;
+    t.ui.step(Step::Write)?;
+    t.begin_change(container, "Adding key access…")?;
     let unlocks = vec![enrollment.unlock.clone()];
     let mut vault = Vault::create(APP, salt, label, &enrollment, SECRET, old.as_bytes())?;
     vault.set_pending(&unlocks, SECRET, new.as_str().as_bytes())?;
@@ -420,17 +457,22 @@ fn close(t: &mut Tools, container: Option<PathBuf>, force: bool) -> Result<()> {
 fn add_key(t: &mut Tools, container: &Path, label: &str) -> Result<()> {
     let mut unlocked = unlock(t, container)?;
     require_finished(&unlocked)?;
-    t.ui.say("Now enroll the new key. If both keys blink, touch the new one.");
+    t.ui.step(Step::Connect)?;
+    t.ui.connect_key("Connect the new key.")?;
+    t.ui.step(Step::Enroll)?;
     let enrollment = t
         .keys
         .enroll(&unlocked.vault.salt(), &unlocked.vault.cred_ids())?;
     t.ui.step(Step::Write)?;
-    t.ui.begin_work("Adding key…")?;
+    t.begin_change(container, "Adding key…")?;
     unlocked
         .vault
         .add_key(&unlocked.unlocks, label, &enrollment)?;
     unlocked.vault.save(&unlocked.slot, false)?;
-    t.ui.say(&format!("Enrolled {label}. The passphrase did not change."));
+    t.ui.say(&format!(
+        "Added {}. The recovery phrase stays the same.",
+        field(label)
+    ));
     Ok(())
 }
 
@@ -442,15 +484,20 @@ fn add_key_with_recovery(t: &mut Tools, container: &Path, label: &str) -> Result
     );
     let slot = slots::path(container);
     let original = read_slot(&slot)?;
-    let typed = t.ui.secret("Recovery passphrase: ")?;
+    t.ui.step(Step::Authenticate)?;
+    let typed = t.ui.secret("Recovery phrase: ")?;
     let passphrase = Passphrase::parse(&typed)?;
+    t.begin_change(container, "Checking the recovery phrase…")?;
     let argon2 = t.vc.opens(container, passphrase.as_str(), Some(HASH))?;
     ensure!(
         argon2 || t.vc.opens(container, passphrase.as_str(), None)?,
-        "That recovery passphrase does not open the container. Nothing was changed."
+        "That recovery phrase does not open the container. Nothing was changed."
     );
+    t.ui.end_work()?;
     let salt = Vault::new_salt()?;
-    t.ui.say("Enroll the key that will open this container.");
+    t.ui.step(Step::Connect)?;
+    t.ui.connect_key("Connect the new key.")?;
+    t.ui.step(Step::Enroll)?;
     let enrollment = t.keys.enroll(&salt, &[])?;
     let mut vault = Vault::create(
         APP,
@@ -469,13 +516,16 @@ fn add_key_with_recovery(t: &mut Tools, container: &Path, label: &str) -> Result
         )?;
     }
     // Enrollment can take minutes. Check the actual header again before replacing metadata.
+    t.ui.step(Step::Write)?;
+    t.begin_change(container, "Restoring key access…")?;
     ensure!(
         t.vc.opens(container, passphrase.as_str(), argon2.then_some(HASH))?,
         "The container changed during enrollment. Its slot file was not replaced. Try recovery again."
     );
     let replaced = replace_slot(&mut vault, &slot, original.as_deref())?;
     t.ui.say(&format!(
-        "Enrolled {label} as the only key of a new slot file. The passphrase did not change."
+        "Added {} as the only key. The recovery phrase stays the same.",
+        field(label)
     ));
     if let Some(old) = replaced {
         t.ui.say(&format!(
@@ -497,7 +547,7 @@ fn remove_key(t: &mut Tools, container: &Path, labels: &[String]) -> Result<()> 
     kept.sort();
     let salt = vault.salt();
     let ids: Vec<&[u8]> = kept.iter().map(|(_, id)| id.as_slice()).collect();
-    t.ui.say("Unlock with a key you keep.");
+    t.ui.step(Step::Authenticate)?;
     let first = t.keys.unlock(&salt, &ids)?;
     // The tag check comes before anything acts on the labels.
     vault.verify(std::slice::from_ref(&first))?;
@@ -512,14 +562,14 @@ fn remove_key(t: &mut Tools, container: &Path, labels: &[String]) -> Result<()> 
         if unlocked.unlocks.iter().any(|u| &u.cred_id == id) {
             continue;
         }
-        t.ui.say(&format!("Plug in the key labeled {label}."));
+        t.ui.connect_key(&format!("Connect “{}”.", field(label)))?;
         let unlock = t.keys.unlock_key(label, &salt, id)?;
         unlocked.unlocks.push(unlock);
     }
     let new = Passphrase::generate()?;
     show_recovery(t.ui, &new)?;
     t.ui.step(Step::Write)?;
-    t.ui.begin_work("Removing keys…")?;
+    t.begin_change(container, "Removing keys…")?;
     unlocked.vault.remove_keys(&labels, &unlocked.unlocks)?;
     unlocked
         .vault
@@ -527,8 +577,12 @@ fn remove_key(t: &mut Tools, container: &Path, labels: &[String]) -> Result<()> 
     unlocked.vault.save(&unlocked.slot, false)?;
     apply_pending(t.vc, container, &mut unlocked)?;
     t.ui.say(&format!(
-        "Removed {}. The passphrase changed, so the old printout no longer works.",
-        labels.join(", ")
+        "Removed {}. Use a remaining key or the new recovery phrase.",
+        labels
+            .iter()
+            .map(|label| field(label))
+            .collect::<Vec<_>>()
+            .join(", ")
     ));
     Ok(())
 }
@@ -539,13 +593,13 @@ fn rotate(t: &mut Tools, container: &Path) -> Result<()> {
     let new = Passphrase::generate()?;
     show_recovery(t.ui, &new)?;
     t.ui.step(Step::Write)?;
-    t.ui.begin_work("Changing recovery phrase…")?;
+    t.begin_change(container, "Changing recovery phrase…")?;
     unlocked
         .vault
         .set_pending(&unlocked.unlocks, SECRET, new.as_str().as_bytes())?;
     unlocked.vault.save(&unlocked.slot, false)?;
     apply_pending(t.vc, container, &mut unlocked)?;
-    t.ui.say("The passphrase changed, so the old printout no longer works.");
+    t.ui.say("Recovery phrase changed. Your keys still work. The old phrase no longer opens this container.");
     Ok(())
 }
 
@@ -646,10 +700,10 @@ fn list_keys(t: &mut Tools, container: &Path) -> Result<()> {
 fn show_recovery(ui: &mut dyn Ui, passphrase: &Passphrase) -> Result<()> {
     ui.step(Step::Recovery)?;
     ui.say(
-        "Your recovery passphrase. Write it down and keep it away from the drive. VeraCrypt alone opens the container with it, typed exactly as shown, dashes included:",
+        "Save this recovery phrase away from the drive. VeraCrypt accepts it exactly as shown, including dashes:",
     );
     ui.show_secret(passphrase.as_str())?;
-    let typed = Zeroizing::new(ui.ask("Type its last group to confirm you wrote it down: ")?);
+    let typed = Zeroizing::new(ui.ask("Enter its last group to confirm you saved it: ")?);
     let typed = Zeroizing::new(
         typed
             .trim()
@@ -688,6 +742,7 @@ fn load(container: &Path) -> Result<(PathBuf, Vault)> {
 /// Unlocks with the key the owner uses, checks the tag, and finishes an interrupted change.
 fn unlock(t: &mut Tools, container: &Path) -> Result<Unlocked> {
     let (slot, vault) = load(container)?;
+    t.ui.step(Step::Authenticate)?;
     let unlock = t.keys.unlock(&vault.salt(), &vault.cred_ids())?;
     vault.verify(std::slice::from_ref(&unlock))?;
     let mut unlocked = Unlocked {
@@ -710,7 +765,7 @@ fn finish_pending(t: &mut Tools, container: &Path, unlocked: &mut Unlocked) -> R
         return Ok(());
     }
     // Even opens() attaches a volume temporarily, so cancellation must stop before probing.
-    t.ui.begin_work("Finishing an earlier change…")?;
+    t.begin_change(container, "Finishing an earlier change…")?;
     repair_pending(t, container, unlocked)?;
     t.ui.end_work()
 }

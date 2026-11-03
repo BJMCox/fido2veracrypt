@@ -1,9 +1,7 @@
 //! Native app callbacks. HID work stays on one thread for hidapi's run-loop lifetime.
 
 use std::ffi::{CStr, c_char, c_void};
-use std::os::unix::fs::MetadataExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
 use std::sync::{OnceLock, mpsc};
 
 use anyhow::{Context, Result, ensure};
@@ -118,24 +116,21 @@ impl Host {
     }
 }
 
-struct AppUi<'a> {
+struct AppUi {
     host: Host,
-    closed: Option<(&'a dyn VeraCrypt, &'a Path)>,
 }
 
-impl Ui for AppUi<'_> {
+impl Ui for AppUi {
     fn step(&mut self, step: Step) -> Result<()> {
         self.host.step(step)
     }
     fn key_label(&mut self, label: &str) -> Result<()> {
         self.host.emit(KEY_LABEL, label, "")
     }
+    fn connect_key(&mut self, prompt: &str) -> Result<()> {
+        self.host.answer(CONNECT, prompt).map(|_| ())
+    }
     fn begin_work(&mut self, message: &str) -> Result<()> {
-        // Commands hold their transaction lock here. Recheck after prompts, since another
-        // client could have opened the container after the initial GUI status check.
-        if let Some((vc, container)) = self.closed {
-            require_closed(vc, container)?;
-        }
         self.host.working(message)
     }
     fn end_work(&mut self) -> Result<()> {
@@ -205,7 +200,6 @@ impl AppKeys {
 
 impl Keys for AppKeys {
     fn unlock(&mut self, salt: &[u8; 32], ids: &[&[u8]]) -> Result<Unlock> {
-        self.host.step(Step::Authenticate)?;
         let touch = if self.adding {
             "Touch a key that already opens this container."
         } else {
@@ -220,10 +214,7 @@ impl Keys for AppKeys {
         self.with_pin(prompt, touch, |pin| fido::derive(APP, &key, pin, salt, ids))
     }
     fn unlock_key(&mut self, label: &str, salt: &[u8; 32], id: &[u8]) -> Result<Unlock> {
-        self.host.step(Step::Authenticate)?;
         let label = crate::ui::field(label);
-        self.host
-            .answer(CONNECT, &format!("Connect “{label}”, then continue."))?;
         let touch = format!("Touch “{label}”.");
         let key = self.choose(&touch)?;
         self.with_pin(&format!("Enter the PIN for “{label}”."), &touch, |pin| {
@@ -231,12 +222,6 @@ impl Keys for AppKeys {
         })
     }
     fn enroll(&mut self, salt: &[u8; 32], exclude: &[&[u8]]) -> Result<Enrollment> {
-        if self.adding {
-            self.host.step(Step::Connect)?;
-            self.host
-                .answer(CONNECT, "Connect the key to add, then continue.")?;
-        }
-        self.host.step(Step::Enroll)?;
         let key = self.choose(if self.adding {
             "Touch the new key."
         } else {
@@ -298,45 +283,15 @@ fn run(args: Vec<String>, host: Host) -> Result<()> {
     if matches!(&command, Command::Close { .. }) {
         host.working("Closing container…")?;
     }
-    let closed = if let Command::AddKey { container, .. }
-    | Command::RemoveKey { container, .. }
-    | Command::Rotate { container } = &command
-    {
-        let container = container
-            .canonicalize()
-            .context("Cannot find the container")?;
-        require_closed(&vc, &container)?;
-        Some(container)
-    } else {
-        None
-    };
     let adding = matches!(&command, Command::AddKey { .. });
     commands::run(
         command,
         &mut Tools {
             vc: &vc,
             keys: &mut AppKeys { host, adding },
-            ui: &mut AppUi {
-                host,
-                closed: closed.as_deref().map(|path| (&vc as &dyn VeraCrypt, path)),
-            },
+            ui: &mut AppUi { host },
         },
     )
-}
-
-fn require_closed(vc: &dyn VeraCrypt, container: &Path) -> Result<()> {
-    let source = container.metadata().context("Cannot find the container")?;
-    for volume in vc.list()? {
-        let attached = volume
-            .container
-            .metadata()
-            .context("An attached container is unavailable. Close it before changing keys.")?;
-        ensure!(
-            (source.dev(), source.ino()) != (attached.dev(), attached.ino()),
-            "Close the container before changing its keys or recovery phrase."
-        );
-    }
-    Ok(())
 }
 
 struct Job {

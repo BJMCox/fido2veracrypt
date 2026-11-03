@@ -19,14 +19,14 @@ _fido2veracrypt_labels() {
 _fido2veracrypt() {
   local -a commands
   commands=(
-    'create:make a container and enroll the plugged-in key'
-    'adopt:enroll a key for an existing container'
-    'open:unlock and mount a container'
-    'close:unmount a container, or every open one'
-    'add-key:enroll another key'
-    'remove-key:remove lost or stolen keys and change the passphrase'
-    'rotate:change the passphrase'
-    'status:show open volumes or one container'
+    'create:create a container and enroll your key'
+    'adopt:add key access to an existing VeraCrypt container'
+    'open:open a container with an enrolled key'
+    'close:close one container, or every open one'
+    'add-key:use an existing key, then enroll the new key'
+    'remove-key:use the keys you keep and remove the selected keys'
+    'rotate:change the recovery phrase'
+    'status:show open containers or one container'
     'list-keys:list the enrolled keys'
     'completions:print the shell completion script'
     'help:show the help text'
@@ -45,7 +45,7 @@ _fido2veracrypt() {
     close)
       _arguments '2::container:_fido2veracrypt_containers' '--force[close even with files open]' ;;
     add-key)
-      _arguments '2:container:_fido2veracrypt_containers' '--label[key label]:label:' '--recovery[use the recovery passphrase]' ;;
+      _arguments '2:container:_fido2veracrypt_containers' '--label[key label]:label:' '--recovery[restore key access with the recovery phrase]' ;;
     remove-key)
       _arguments '2:container:_fido2veracrypt_containers' '*--label[key to remove]:label:_fido2veracrypt_labels' ;;
     status)

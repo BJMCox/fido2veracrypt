@@ -19,12 +19,13 @@ fn main() -> ExitCode {
             }
         };
     let vc = Lazy::default();
+    let mut terminal = Terminal::new(&command);
     let result = commands::run(
         command,
         &mut Tools {
             vc: &vc,
             keys: &mut Fido,
-            ui: &mut Terminal,
+            ui: &mut terminal,
         },
     );
     match result {
