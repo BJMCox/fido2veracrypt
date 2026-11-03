@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct MainView: View {
@@ -7,11 +8,7 @@ struct MainView: View {
     VStack(spacing: 0) {
       HStack(spacing: 12) {
         Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 38, height: 38)
-        VStack(alignment: .leading, spacing: 3) {
-          Text("Your containers").font(.title2.weight(.semibold))
-          Text("Open with your key. Use your files in Finder.").font(.callout).foregroundStyle(
-            .secondary)
-        }
+        Text("Containers").font(.title2.weight(.semibold))
         Spacer()
         Button("Open…", action: model.openPicker).keyboardShortcut("o")
         Button("Create…", action: model.createPicker).keyboardShortcut("n").buttonStyle(
@@ -22,14 +19,9 @@ struct MainView: View {
       Divider()
       if model.containers.isEmpty {
         VStack(spacing: 14) {
-          Image(systemName: "lock.shield").font(.system(size: 52, weight: .light)).foregroundStyle(
+          Image(systemName: "archivebox").font(.system(size: 52, weight: .light)).foregroundStyle(
             .secondary)
-          Text("A home for your private files").font(.title2.weight(.medium))
-          Text("Create an encrypted container on a drive,\nor open one you already use.")
-            .multilineTextAlignment(.center).foregroundStyle(.secondary)
-          Button("Create a Container…", action: model.createPicker).controlSize(.large)
-            .buttonStyle(.borderedProminent).padding(.top, 4).disabled(
-              model.busy || model.refreshing)
+          Text("No containers").foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
       } else {
@@ -57,7 +49,7 @@ struct MainView: View {
       Divider()
       HStack(spacing: 7) {
         Image(systemName: "info.circle")
-        Text("Close your containers before unplugging the drive.")
+        Text("Close containers before unplugging the drive.")
         Spacer()
         if model.refreshing {
           ProgressView().controlSize(.small).accessibilityLabel("Checking container status")
@@ -69,7 +61,18 @@ struct MainView: View {
       .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 20).padding(.vertical, 13)
     }
     .frame(minWidth: 640, minHeight: 400)
-    .sheet(item: $model.operation) { _ in OperationView(model: model).interactiveDismissDisabled() }
+    .sheet(
+      isPresented: Binding(
+        get: { model.busy }, set: { if !$0 { model.dismissKeys() } })
+    ) {
+      Group {
+        if model.operation != nil {
+          OperationView(model: model)
+        } else if model.keyManager != nil {
+          KeyManagerView(model: model)
+        }
+      }.interactiveDismissDisabled()
+    }
     .alert(
       "Fido2VC",
       isPresented: Binding(get: { model.alert != nil }, set: { if !$0 { model.alert = nil } })
@@ -101,7 +104,7 @@ private struct ContainerRow: View {
           .secondary
         ).lineLimit(1).truncationMode(.middle)
         if state == .halfClosed {
-          Text("Finder ejected the files. Close the container to finish locking it.").font(.caption)
+          Text("Ejected in Finder. Close to lock.").font(.caption)
             .foregroundStyle(.orange)
         }
       }
@@ -121,6 +124,8 @@ private struct ContainerRow: View {
         Text("Connect the drive").font(.callout).foregroundStyle(.secondary)
       }
       Menu {
+        Button("Keys…") { model.showKeys(container) }.disabled(state == .unavailable)
+        Divider()
         Button("Show Container in Finder") {
           NSWorkspace.shared.activateFileViewerSelecting([container.url])
         }
@@ -143,6 +148,7 @@ struct OperationView: View {
 
   private var canSubmit: Bool {
     guard let operation = model.operation, answer.utf8.count < 4096 else { return false }
+    if operation.prompt == .connect { return true }
     if operation.prompt == .confirmation {
       let normalized = answer.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         .replacingOccurrences(of: "I", with: "1").replacingOccurrences(of: "L", with: "1")
@@ -156,23 +162,64 @@ struct OperationView: View {
     if let operation = model.operation {
       VStack(alignment: .leading, spacing: 18) {
         HStack(spacing: 13) {
-          Image(systemName: operation.prompt == .confirmation ? "key.horizontal" : "lock.shield")
+          Image(systemName: operation.prompt == .confirmation ? "key.horizontal" : "archivebox")
             .font(.system(size: 28)).foregroundStyle(.tint)
-          Text(operation.title).font(.title2.weight(.semibold))
+          VStack(alignment: .leading, spacing: 4) {
+            if operation.workflow != nil {
+              Text(operation.title).font(.caption).foregroundStyle(.secondary)
+            }
+            Text(operation.heading).font(.title2.weight(.semibold))
+          }
         }
-        Text(operation.message).font(.headline)
-        if operation.prompt == .confirmation {
+        if let workflow = operation.workflow {
+          VStack(alignment: .leading, spacing: 9) {
+            ForEach(Array(workflow.steps.enumerated()), id: \.offset) { index, step in
+              let done = operation.completed || index < operation.stepIndex
+              let active = !operation.completed && index == operation.stepIndex
+              HStack(spacing: 9) {
+                Image(
+                  systemName: done
+                    ? "checkmark.circle.fill" : (active ? "circle.inset.filled" : "circle")
+                )
+                .foregroundStyle(done || active ? Color.accentColor : Color.secondary)
+                Text(workflow.title(for: step)).fontWeight(active ? .semibold : .regular)
+                  .foregroundStyle(active ? .primary : .secondary)
+              }
+              .accessibilityElement(children: .ignore)
+              .accessibilityLabel(
+                "\(workflow.title(for: step)), \(done ? "complete" : (active ? "current step" : "next step"))"
+              )
+            }
+          }
+          .font(.callout)
+          Divider()
+        }
+        if !operation.message.isEmpty { Text(operation.message).font(.headline) }
+        if operation.completed {
+          if !operation.detail.isEmpty {
+            Text(operation.detail).font(.callout).foregroundStyle(.orange).textSelection(.enabled)
+          }
+        } else if operation.prompt == .confirmation {
           Text(
-            "Write this down and keep it away from the drive. It opens the container if you lose your key."
+            "Keep this phrase separate from the drive. Use it if you lose the key."
           )
           .foregroundStyle(.secondary)
-          Text(operation.recovery).font(.system(.body, design: .monospaced)).lineSpacing(5)
-            .fixedSize(horizontal: false, vertical: true).padding(14)
-            .frame(maxWidth: .infinity, alignment: .leading).background(
-              .quaternary, in: RoundedRectangle(cornerRadius: 8)
-            )
-            .privacySensitive()
-          TextField("Last group of the phrase", text: $answer).focused($inputFocused)
+          VStack(alignment: .leading, spacing: 10) {
+            Text(operation.recovery).font(.system(.body, design: .monospaced)).lineSpacing(5)
+              .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+              .privacySensitive()
+            HStack {
+              Spacer()
+              Button("Copy phrase") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(operation.recovery, forType: .string)
+              }
+              .accessibilityIdentifier("copy-recovery-phrase")
+            }
+          }
+          .padding(14).frame(maxWidth: .infinity, alignment: .leading)
+          .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+          TextField("Last group", text: $answer).focused($inputFocused)
             .textFieldStyle(.roundedBorder).frame(width: 210).privacySensitive()
             .onSubmit(submit).accessibilityIdentifier("recovery-confirmation")
         } else if operation.prompt == .pin {
@@ -182,7 +229,7 @@ struct OperationView: View {
           SecureField("Security key PIN", text: $answer).focused($inputFocused)
             .textFieldStyle(.roundedBorder).onSubmit(submit).privacySensitive()
             .accessibilityIdentifier("security-key-pin")
-        } else {
+        } else if operation.prompt != .connect {
           HStack(spacing: 12) {
             ProgressView().controlSize(.small)
             Text(operation.detail).font(.callout).foregroundStyle(.secondary)
@@ -190,7 +237,10 @@ struct OperationView: View {
         }
         HStack {
           Spacer()
-          if operation.cancellable {
+          if operation.completed {
+            Button("Done", action: model.finishOperation)
+              .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
+          } else if operation.cancellable {
             Button("Cancel") {
               answer = ""
               model.cancel()
@@ -198,7 +248,8 @@ struct OperationView: View {
           }
           if operation.prompt != nil {
             Button(
-              operation.prompt == .confirmation ? "Create Container" : "Continue", action: submit
+              operation.prompt == .confirmation ? operation.confirmationAction : "Continue",
+              action: submit
             )
             .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent).disabled(!canSubmit)
           }

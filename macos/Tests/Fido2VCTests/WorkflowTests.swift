@@ -33,6 +33,12 @@ import Testing
     running.receive(
       BackendMessage(kind: .working, text: "", detail: ""), response: nil, capacity: 0) == 0)
   #expect(!running.cancel())
+  _ = running.receive(
+    BackendMessage(kind: .ready, text: "", detail: ""), response: nil, capacity: 0)
+  #expect(running.cancel())
+  #expect(
+    running.receive(
+      BackendMessage(kind: .working, text: "", detail: ""), response: nil, capacity: 0) == -1)
 }
 
 @Test func successKeepsWarningsUntilTheUserCanReadThem() {
@@ -43,6 +49,206 @@ import Testing
   _ = channel.receive(
     BackendMessage(kind: .info, text: "Created", detail: ""), response: nil, capacity: 0)
   #expect(channel.result(0).warnings == [warning])
+}
+
+@Test func keyConnectionWaitsForContinueOrCancel() async {
+  for cancel in [false, true] {
+    let prompted = AsyncStream<Void>.makeStream()
+    let channel = OperationChannel { _ in
+      prompted.continuation.yield(())
+      prompted.continuation.finish()
+    }
+    let waiting = Task.detached {
+      var response = [UInt8](repeating: 0, count: 8)
+      return response.withUnsafeMutableBufferPointer { buffer in
+        channel.receive(
+          BackendMessage(kind: .connect, text: "Connect the new key.", detail: ""),
+          response: buffer.baseAddress, capacity: buffer.count)
+      }
+    }
+    for await _ in prompted.stream { break }
+    if cancel { _ = channel.cancel() } else { channel.respond("") }
+    let result = await waiting.value
+    #expect(result == (cancel ? -1 : 0))
+  }
+}
+
+@Test func nulInAnArgumentCannotChangeWhichKeyIsNamed() async {
+  let channel = OperationChannel { _ in }
+  let result = await RustBackend.run(
+    ["remove-key", "/unused.hc", "--label", "Backup\0Other"], channel: channel)
+  #expect(result.code == 1)
+  #expect(result.error != nil)
+}
+
+private actor KeyBackend {
+  var labels = ["Main key", "Spare — café", "é", "e\u{301}"]
+  var actions: [[String]] = []
+  var failNextChange = false
+  var open = false
+
+  func failAndLeaveOpen() { failNextChange = true }
+
+  func run(_ args: [String], _ channel: OperationChannel) -> BackendResult {
+    switch args[0] {
+    case "volumes":
+      if open {
+        _ = channel.receive(
+          BackendMessage(kind: .volume, text: actions.last![1], detail: "/Volumes/Example"),
+          response: nil, capacity: 0)
+      }
+    case "list-keys":
+      for label in labels {
+        _ = channel.receive(
+          BackendMessage(kind: .keyLabel, text: label, detail: ""), response: nil, capacity: 0)
+      }
+    default:
+      actions.append(args)
+      if failNextChange {
+        failNextChange = false
+        open = true
+        _ = channel.receive(
+          BackendMessage(kind: .error, text: "The probe could not close.", detail: ""),
+          response: nil, capacity: 0)
+        return channel.result(1)
+      }
+      if args[0] == "add-key" { labels.append(args[3]) }
+      if args[0] == "remove-key" {
+        labels.removeAll { label in args.dropFirst(2).contains { $0.utf8.elementsEqual(label.utf8) }
+        }
+      }
+    }
+    return channel.result(0)
+  }
+}
+
+@MainActor private func waitForKeys(_ model: AppModel) async throws {
+  let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+  while (model.operation != nil || model.keyManager?.loading != false)
+    && ContinuousClock.now < deadline
+  {
+    if model.operation?.completed == true { model.finishOperation() }
+    try await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(model.operation == nil && model.keyManager?.loading == false)
+}
+
+private func keyIDs(_ labels: [String]) -> Set<Data> { Set(labels.map { Data($0.utf8) }) }
+
+@MainActor private func waitUntil(_ ready: () -> Bool) async throws {
+  let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+  while !ready() && ContinuousClock.now < deadline {
+    try await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(ready())
+}
+
+@Test @MainActor func addKeyWizardShowsWhichKeyToUseAndWaitsForSuccess() async throws {
+  let suite = "Fido2VC-test-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID()).hc")
+  try Data("public test fixture".utf8).write(to: url)
+  defer { try? FileManager.default.removeItem(at: url) }
+  let saved = SavedContainer(url: url)
+  let messages = AsyncStream<BackendMessage>.makeStream()
+  let model = AppModel(defaults: defaults) { args, channel in
+    if args[0] == "add-key" {
+      for await message in messages.stream {
+        if channel.receive(message, response: nil, capacity: 0) < 0 { return channel.result(2) }
+      }
+    } else if args[0] == "list-keys" {
+      _ = channel.receive(
+        BackendMessage(kind: .keyLabel, text: "Existing key", detail: ""), response: nil,
+        capacity: 0)
+    }
+    return channel.result(0)
+  }
+  model.containers = [saved]
+  model.showKeys(saved)
+  try await waitForKeys(model)
+  model.addKey("New key")
+  #expect(model.operation?.heading == "Use an existing key")
+  #expect(model.operation?.stepIndex == 0)
+  messages.continuation.yield(
+    BackendMessage(kind: .working, text: "Finishing an earlier change…", detail: ""))
+  try await waitUntil { model.operation?.cancellable == false }
+  #expect(model.operation?.stepIndex == 0)
+  messages.continuation.yield(BackendMessage(kind: .ready, text: "", detail: ""))
+  try await waitUntil { model.operation?.cancellable == true }
+  for (step, index, heading) in [
+    ("connect", 1, "Connect the new key"),
+    ("enroll", 2, "Enroll the new key"),
+    ("write", 3, "Save the new key"),
+  ] {
+    messages.continuation.yield(BackendMessage(kind: .step, text: step, detail: ""))
+    try await waitUntil { model.operation?.stepIndex == index }
+    #expect(model.operation?.heading == heading)
+    #expect(model.operation?.completed == false)
+    if step == "enroll" {
+      messages.continuation.yield(
+        BackendMessage(kind: .touch, text: "Touch the new key.", detail: ""))
+      try await waitUntil { model.operation?.message == "Touch the new key." }
+    }
+  }
+  #expect(model.operation?.message == "Checking the container…")
+  messages.continuation.yield(
+    BackendMessage(kind: .warning, text: "Public test warning", detail: ""))
+  messages.continuation.finish()
+  try await waitUntil { model.operation?.completed == true }
+  #expect(model.operation?.heading == "Key added")
+  #expect(model.operation?.detail == "Public test warning")
+  #expect(model.operation?.prompt == nil && model.operation?.recovery.isEmpty == true)
+  model.finishOperation()
+  try await waitForKeys(model)
+  #expect(model.keyManager?.container.id == saved.id)
+}
+
+@Test @MainActor func keyActionsPreserveNamesAndRefreshAccess() async throws {
+  let suite = "Fido2VC-test-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID()).hc")
+  try Data("public test fixture".utf8).write(to: url)
+  defer { try? FileManager.default.removeItem(at: url) }
+  let saved = SavedContainer(url: url)
+  let backend = KeyBackend()
+  let model = AppModel(defaults: defaults) { args, channel in await backend.run(args, channel) }
+  model.containers = [saved]
+  model.showKeys(saved)
+  try await waitForKeys(model)
+  #expect(model.keyManager?.labels == ["Main key", "Spare — café", "é", "e\u{301}"])
+  #expect(Set(model.keyManager!.keys.map(\.id)).count == 4)
+  #expect(model.canChangeKeys)
+  model.removeKeys(keyIDs(["Main key", "Spare — café", "é", "e\u{301}"]))
+  let initialActions = await backend.actions
+  #expect(initialActions.isEmpty)
+  model.addKey("  Travel key  ")
+  try await waitForKeys(model)
+  #expect(model.keyManager?.labels == ["Main key", "Spare — café", "é", "e\u{301}", "Travel key"])
+  model.removeKeys(keyIDs(["Spare — café", "é"]))
+  try await waitForKeys(model)
+  #expect(
+    model.keyManager?.labels.map { Data($0.utf8) }
+      == ["Main key", "e\u{301}", "Travel key"].map { Data($0.utf8) })
+  model.changeRecoveryPhrase()
+  try await waitForKeys(model)
+  let actions = await backend.actions
+  #expect(
+    actions == [
+      ["add-key", saved.path, "--label", "Travel key"],
+      ["remove-key", saved.path, "--label", "Spare — café", "--label", "é"],
+      ["rotate", saved.path],
+    ])
+  await backend.failAndLeaveOpen()
+  model.addKey("Another")
+  try await waitForKeys(model)
+  #expect(model.states[saved.id] == .open("/Volumes/Example"))
+  #expect(!model.canChangeKeys)
+  #expect(model.keyManager?.notice == "The probe could not close.")
+  model.removeKeys(keyIDs(["Travel key"]))
+  let afterFailure = await backend.actions
+  #expect(afterFailure.count == actions.count + 1)
 }
 
 @Test func rememberedContainersSurviveRelaunchAndForgetKeepsTheFile() throws {

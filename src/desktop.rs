@@ -1,10 +1,12 @@
 //! Native app callbacks. HID work stays on one thread for hidapi's run-loop lifetime.
 
 use std::ffi::{CStr, c_char, c_void};
+use std::os::unix::fs::MetadataExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::Path;
 use std::sync::{OnceLock, mpsc};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use fido2kit::fido::{self, Enrollment, FidoError, Key, Unlock};
 use zeroize::Zeroizing;
 
@@ -12,7 +14,7 @@ use crate::cli::{self, Command};
 use crate::commands::{self, Tools};
 use crate::keys::Keys;
 use crate::slots::APP;
-use crate::ui::Ui;
+use crate::ui::{Step, Ui};
 use crate::veracrypt::{Real, VeraCrypt};
 
 const INFO: u32 = 1;
@@ -25,6 +27,10 @@ const VOLUME: u32 = 7;
 const ERROR: u32 = 8;
 const CHECK: u32 = 9;
 const WARNING: u32 = 10;
+const KEY_LABEL: u32 = 11;
+const CONNECT: u32 = 12;
+const READY: u32 = 13;
+const STEP: u32 = 14;
 const RESPONSE_CAPACITY: usize = 4096;
 
 type Callback = unsafe extern "C" fn(
@@ -99,61 +105,90 @@ impl Host {
         // The host checks Cancel and enters non-cancellable work in one serialized step.
         self.emit(WORKING, text, "")
     }
+
+    fn step(&self, step: Step) -> Result<()> {
+        let name = match step {
+            Step::Authenticate => "authenticate",
+            Step::Connect => "connect",
+            Step::Enroll => "enroll",
+            Step::Recovery => "recovery",
+            Step::Write => "write",
+        };
+        self.emit(STEP, name, "")
+    }
 }
 
-struct AppUi(Host);
+struct AppUi<'a> {
+    host: Host,
+    closed: Option<(&'a dyn VeraCrypt, &'a Path)>,
+}
 
-impl Ui for AppUi {
+impl Ui for AppUi<'_> {
+    fn step(&mut self, step: Step) -> Result<()> {
+        self.host.step(step)
+    }
+    fn key_label(&mut self, label: &str) -> Result<()> {
+        self.host.emit(KEY_LABEL, label, "")
+    }
+    fn begin_work(&mut self, message: &str) -> Result<()> {
+        // Commands hold their transaction lock here. Recheck after prompts, since another
+        // client could have opened the container after the initial GUI status check.
+        if let Some((vc, container)) = self.closed {
+            require_closed(vc, container)?;
+        }
+        self.host.working(message)
+    }
+    fn end_work(&mut self) -> Result<()> {
+        self.host.emit(READY, "", "")
+    }
     fn say(&mut self, text: &str) {
-        let _ = self.0.emit(INFO, text, "");
+        let _ = self.host.emit(INFO, text, "");
     }
     fn warn(&mut self, text: &str) {
-        let _ = self.0.emit(WARNING, text, "");
+        let _ = self.host.emit(WARNING, text, "");
     }
     fn show_secret(&mut self, text: &str) -> Result<()> {
-        self.0.emit(RECOVERY, text, "")
+        self.host.emit(RECOVERY, text, "")
     }
     fn secret(&mut self, prompt: &str) -> Result<Zeroizing<String>> {
-        self.0.answer(PIN, prompt)
+        self.host.answer(PIN, prompt)
     }
     fn ask(&mut self, prompt: &str) -> Result<String> {
-        let answer = self.0.answer(CONFIRM, prompt)?;
-        // Create's recovery check is the only visible question in this scoped bridge.
-        // It writes its slot before calling VeraCrypt, so start the barrier before returning.
-        self.0.working("Creating container…")?;
+        let answer = self.host.answer(CONFIRM, prompt)?;
         Ok(answer.to_string())
     }
 }
 
-struct AppKeys(Host);
+struct AppKeys {
+    host: Host,
+    adding: bool,
+}
 
 impl AppKeys {
-    fn choose(&self) -> Result<Key> {
-        self.0.emit(CHECK, "", "")?;
+    fn choose(&self, prompt: &str) -> Result<Key> {
+        self.host.emit(CHECK, "", "")?;
         let devices = fido::devices();
         if devices.len() > 1 {
-            self.0.emit(
-                TOUCH,
-                "Touch the key you want to use.",
-                "Several keys are connected.",
-            )?;
+            self.host
+                .emit(TOUCH, prompt, "Several keys are connected.")?;
         }
         let key = fido::select(devices)?;
-        self.0.emit(CHECK, "", "")?;
+        self.host.emit(CHECK, "", "")?;
         Ok(key)
     }
 
     fn with_pin<T>(
         &self,
+        prompt: &str,
         touch: &str,
         mut attempt: impl FnMut(&str) -> Result<T, FidoError>,
     ) -> Result<T> {
         loop {
-            let pin = self.0.answer(PIN, "Enter your security key's PIN.")?;
+            let pin = self.host.answer(PIN, prompt)?;
             ensure!(!pin.is_empty(), "Enter the key's PIN.");
-            self.0.emit(TOUCH, touch, "Keep the key connected.")?;
+            self.host.emit(TOUCH, touch, "Keep the key connected.")?;
             let result = attempt(&pin);
-            self.0.emit(CHECK, "", "")?;
+            self.host.emit(CHECK, "", "")?;
             match result {
                 Ok(value) => return Ok(value),
                 Err(error) => {
@@ -161,7 +196,7 @@ impl AppKeys {
                     if !fido::retry_pin(&error) {
                         return Err(error);
                     }
-                    self.0.emit(INFO, &error.to_string(), "")?;
+                    self.host.emit(INFO, &error.to_string(), "")?;
                 }
             }
         }
@@ -170,21 +205,54 @@ impl AppKeys {
 
 impl Keys for AppKeys {
     fn unlock(&mut self, salt: &[u8; 32], ids: &[&[u8]]) -> Result<Unlock> {
-        let key = self.choose()?;
-        let unlock = self.with_pin("Touch your security key.", |pin| {
-            fido::derive(APP, &key, pin, salt, ids)
-        })?;
-        // Unlock may repair a pending passphrase change before mount. Cover that whole path.
-        self.0.working("Opening container…")?;
-        Ok(unlock)
+        self.host.step(Step::Authenticate)?;
+        let touch = if self.adding {
+            "Touch a key that already opens this container."
+        } else {
+            "Touch your security key."
+        };
+        let key = self.choose(touch)?;
+        let prompt = if self.adding {
+            "Enter the PIN of an existing key."
+        } else {
+            "Enter your security key's PIN."
+        };
+        self.with_pin(prompt, touch, |pin| fido::derive(APP, &key, pin, salt, ids))
     }
-    fn unlock_key(&mut self, _: &str, _: &[u8; 32], _: &[u8]) -> Result<Unlock> {
-        bail!("This version of the app does not remove keys")
+    fn unlock_key(&mut self, label: &str, salt: &[u8; 32], id: &[u8]) -> Result<Unlock> {
+        self.host.step(Step::Authenticate)?;
+        let label = crate::ui::field(label);
+        self.host
+            .answer(CONNECT, &format!("Connect “{label}”, then continue."))?;
+        let touch = format!("Touch “{label}”.");
+        let key = self.choose(&touch)?;
+        self.with_pin(&format!("Enter the PIN for “{label}”."), &touch, |pin| {
+            fido::derive(APP, &key, pin, salt, &[id])
+        })
     }
     fn enroll(&mut self, salt: &[u8; 32], exclude: &[&[u8]]) -> Result<Enrollment> {
-        let key = self.choose()?;
+        if self.adding {
+            self.host.step(Step::Connect)?;
+            self.host
+                .answer(CONNECT, "Connect the key to add, then continue.")?;
+        }
+        self.host.step(Step::Enroll)?;
+        let key = self.choose(if self.adding {
+            "Touch the new key."
+        } else {
+            "Touch the key you want to use."
+        })?;
         self.with_pin(
-            "Touch your key, then touch it again when it blinks.",
+            if self.adding {
+                "Enter the new key's PIN."
+            } else {
+                "Enter your security key's PIN."
+            },
+            if self.adding {
+                "Touch the new key, then touch it again when it blinks."
+            } else {
+                "Touch your key, then touch it again when it blinks."
+            },
             |pin| fido::enroll(APP, &key, pin, salt, exclude),
         )
     }
@@ -213,24 +281,62 @@ fn run(args: Vec<String>, host: Host) -> Result<()> {
             &command,
             Command::Create { .. }
                 | Command::Open { .. }
+                | Command::ListKeys { .. }
+                | Command::AddKey {
+                    recovery: false,
+                    ..
+                }
+                | Command::RemoveKey { .. }
+                | Command::Rotate { .. }
                 | Command::Close {
                     container: Some(_),
                     force: false
                 }
         ),
-        "The app supports creating, opening, and closing containers"
+        "This command is not available in the app"
     );
     if matches!(&command, Command::Close { .. }) {
         host.working("Closing container…")?;
     }
+    let closed = if let Command::AddKey { container, .. }
+    | Command::RemoveKey { container, .. }
+    | Command::Rotate { container } = &command
+    {
+        let container = container
+            .canonicalize()
+            .context("Cannot find the container")?;
+        require_closed(&vc, &container)?;
+        Some(container)
+    } else {
+        None
+    };
+    let adding = matches!(&command, Command::AddKey { .. });
     commands::run(
         command,
         &mut Tools {
             vc: &vc,
-            keys: &mut AppKeys(host),
-            ui: &mut AppUi(host),
+            keys: &mut AppKeys { host, adding },
+            ui: &mut AppUi {
+                host,
+                closed: closed.as_deref().map(|path| (&vc as &dyn VeraCrypt, path)),
+            },
         },
     )
+}
+
+fn require_closed(vc: &dyn VeraCrypt, container: &Path) -> Result<()> {
+    let source = container.metadata().context("Cannot find the container")?;
+    for volume in vc.list()? {
+        let attached = volume
+            .container
+            .metadata()
+            .context("An attached container is unavailable. Close it before changing keys.")?;
+        ensure!(
+            (source.dev(), source.ino()) != (attached.dev(), attached.ino()),
+            "Close the container before changing its keys or recovery phrase."
+        );
+    }
+    Ok(())
 }
 
 struct Job {
@@ -273,7 +379,8 @@ pub unsafe extern "C" fn fvc_run(
     context: *mut c_void,
 ) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
-        if argv.is_null() || argc == 0 || argc > 16 {
+        // A vault can hold 255 keys, and Remove takes one --label pair per removed key.
+        if argv.is_null() || argc == 0 || argc > 512 {
             return 1;
         }
         // The caller supplies the pointer and string lifetimes documented above.

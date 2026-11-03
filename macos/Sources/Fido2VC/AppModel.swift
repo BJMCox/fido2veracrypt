@@ -7,6 +7,7 @@ final class AppModel: ObservableObject {
   @Published var containers: [SavedContainer]
   @Published var states: [UUID: ContainerState] = [:]
   @Published var operation: OperationViewState?
+  @Published var keyManager: KeyManagerState?
   @Published var alert: String?
   @Published var statusError: String?
   @Published var refreshing = false
@@ -29,12 +30,12 @@ final class AppModel: ObservableObject {
       containers = try store.load()
     } catch {
       persistenceError =
-        "Saved containers could not be read. The saved records have been kept and will not be overwritten. You can still open containers manually."
+        "Cannot read saved containers. The saved list is unchanged. Open a container manually."
       statusError = persistenceError
     }
   }
 
-  var busy: Bool { operation != nil }
+  var busy: Bool { operation != nil || keyManager != nil }
   var hasOpenContainers: Bool { states.values.contains(where: \.isOpen) }
   var needsQuitWarning: Bool {
     refreshing || persistenceError != nil || hasOpenContainers
@@ -104,7 +105,7 @@ final class AppModel: ObservableObject {
     guard !busy, let window, window.attachedSheet == nil else { return }
     let panel = NSOpenPanel()
     panel.title = "Open Container"
-    panel.message = "Choose a container with its security-key file beside it."
+    panel.message = "Keep the .fido2veracrypt_meta file beside the container."
     panel.prompt = "Open"
     panel.canChooseDirectories = false
     panel.allowsMultipleSelection = false
@@ -150,7 +151,6 @@ final class AppModel: ObservableObject {
     let panel = NSSavePanel()
     panel.title = "Create Container"
     panel.prompt = "Create"
-    panel.message = "Choose where to keep your encrypted files."
     panel.nameFieldStringValue = "Private.hc"
     panel.allowedContentTypes = [UTType(filenameExtension: "hc") ?? .data]
     panel.canCreateDirectories = true
@@ -168,7 +168,8 @@ final class AppModel: ObservableObject {
             "create", url.path, "--size", options.size + options.unit,
             "--label", options.label.trimmingCharacters(in: .whitespacesAndNewlines),
           ],
-          title: "Create \(url.deletingPathExtension().lastPathComponent)", url: url)
+          title: "Create \(url.deletingPathExtension().lastPathComponent)", url: url,
+          confirmationAction: "Create")
       }
     }
   }
@@ -185,7 +186,7 @@ final class AppModel: ObservableObject {
       try store.save(containers)
     } catch {
       persistenceError =
-        "The saved container list could not be updated. Its previous records were kept."
+        "Cannot save the container list. The previous list is unchanged."
       statusError = persistenceError
     }
   }
@@ -205,6 +206,80 @@ final class AppModel: ObservableObject {
   }
   func showFiles(_ path: String) { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }
 
+  func showKeys(_ container: SavedContainer) {
+    guard !busy, !refreshing else { return }
+    loadKeys(container)
+  }
+
+  private func loadKeys(_ container: SavedContainer, notice: String? = nil) {
+    let manager = KeyManagerState(container: container, notice: notice)
+    keyManager = manager
+    // Read status again after every key operation, including failures and cancellations.
+    refreshing = true
+    Task {
+      await readStatus()
+      guard keyManager?.id == manager.id else { return }
+      let current = containers.first(where: { $0.id == container.id }) ?? container
+      keyManager?.container = current
+      let result = await runBackend(["list-keys", current.path], OperationChannel { _ in })
+      guard keyManager?.id == manager.id else { return }
+      keyManager?.labels = result.code == 0 ? result.keys : []
+      keyManager?.error = result.code == 0 ? nil : (result.error ?? "Could not read keys.")
+      keyManager?.loading = false
+    }
+  }
+
+  func dismissKeys() {
+    guard operation == nil, keyManager?.loading == false else { return }
+    keyManager = nil
+    refresh()
+  }
+
+  var canChangeKeys: Bool {
+    guard let manager = keyManager, !manager.loading, manager.error == nil else { return false }
+    return states[manager.container.id] == .closed
+  }
+
+  func canAddKey(_ name: String) -> Bool {
+    let label = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard canChangeKeys, let manager = keyManager,
+      !label.isEmpty, label.utf8.count <= 256, !label.contains("\0"),
+      !manager.labels.contains(where: { $0.utf8.elementsEqual(label.utf8) })
+    else { return false }
+    return true
+  }
+
+  func addKey(_ name: String) {
+    guard canAddKey(name), let manager = keyManager else { return }
+    let label = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    keyManager = nil
+    perform(
+      ["add-key", manager.container.path, "--label", label], title: "Add Key",
+      url: manager.container.url, returningToKeys: manager.container)
+  }
+
+  func removeKeys(_ ids: Set<Data>) {
+    guard canChangeKeys, let manager = keyManager else { return }
+    let labels = manager.labels.filter { ids.contains(Data($0.utf8)) }
+    guard !labels.isEmpty, labels.count == ids.count, labels.count < manager.labels.count
+    else { return }
+    keyManager = nil
+    let flags = labels.flatMap { ["--label", $0] }
+    perform(
+      ["remove-key", manager.container.path] + flags, title: "Remove Keys",
+      url: manager.container.url, confirmationAction: "Remove Keys",
+      returningToKeys: manager.container)
+  }
+
+  func changeRecoveryPhrase() {
+    guard canChangeKeys, let manager = keyManager else { return }
+    keyManager = nil
+    perform(
+      ["rotate", manager.container.path], title: "Change Recovery Phrase",
+      url: manager.container.url, confirmationAction: "Change Phrase",
+      returningToKeys: manager.container)
+  }
+
   func cancel() {
     guard channel?.cancel() == true else { return }
     operation?.prompt = nil
@@ -212,7 +287,7 @@ final class AppModel: ObservableObject {
     operation?.cancellable = false
     operation?.cancelled = true
     operation?.message = "Cancelling…"
-    operation?.detail = "Wait for the key to finish responding."
+    operation?.detail = "Waiting for the key…"
   }
 
   func respond(_ answer: String) {
@@ -221,9 +296,29 @@ final class AppModel: ObservableObject {
     channel?.respond(answer)
   }
 
+  func finishOperation() {
+    guard let finished = operation, finished.completed else { return }
+    operation = nil
+    if let container = finished.returningToKeys {
+      loadKeys(container)
+    } else {
+      refresh()
+    }
+  }
+
   private func receive(_ message: BackendMessage, id: UUID) {
-    guard operation?.id == id, operation?.cancelled == false else { return }
+    guard operation?.id == id, operation?.cancelled == false, operation?.completed == false else {
+      return
+    }
     switch message.kind {
+    case .step:
+      guard let step = WorkflowStep(rawValue: message.text),
+        operation?.workflow?.steps.contains(step) == true
+      else { return }
+      operation?.step = step
+      operation?.prompt = nil
+      operation?.message = step == .write ? "Checking the container…" : ""
+      operation?.detail = ""
     case .info, .warning:
       operation?.detail = message.text
     case .pin:
@@ -231,7 +326,11 @@ final class AppModel: ObservableObject {
       operation?.message = message.text
     case .confirm:
       operation?.prompt = .confirmation
-      operation?.message = "Save your recovery phrase"
+      operation?.message = "Recovery phrase"
+    case .connect:
+      operation?.prompt = .connect
+      operation?.message = message.text
+      operation?.detail = ""
     case .recovery:
       operation?.recovery = message.text
     case .touch:
@@ -243,15 +342,24 @@ final class AppModel: ObservableObject {
       operation?.recovery = ""
       operation?.cancellable = false
       operation?.message = message.text
-      operation?.detail = "Keep the drive connected until this finishes."
-    case .error, .volume, .check: break
+      operation?.detail = "Keep the drive connected."
+    case .ready:
+      operation?.cancellable = true
+    case .error, .volume, .check, .keyLabel: break
     }
   }
 
-  private func perform(_ arguments: [String], title: String, url: URL) {
+  private func perform(
+    _ arguments: [String], title: String, url: URL, confirmationAction: String = "Continue",
+    returningToKeys: SavedContainer? = nil
+  ) {
     guard !busy else { return }
     if refreshing {
-      deferUntilRefreshed { [weak self] in self?.perform(arguments, title: title, url: url) }
+      deferUntilRefreshed { [weak self] in
+        self?.perform(
+          arguments, title: title, url: url, confirmationAction: confirmationAction,
+          returningToKeys: returningToKeys)
+      }
       return
     }
     guard !url.path.contains(where: { $0.isNewline || $0 == "\0" }) else {
@@ -259,7 +367,10 @@ final class AppModel: ObservableObject {
       return
     }
     let id = UUID()
-    operation = OperationViewState(id: id, title: title)
+    let workflow = arguments.first.flatMap { Workflow(rawValue: $0) }
+    operation = OperationViewState(
+      id: id, title: title, confirmationAction: confirmationAction,
+      workflow: workflow, step: workflow?.steps.first, returningToKeys: returningToKeys)
     let channel = OperationChannel { [weak self] message in
       DispatchQueue.main.async { self?.receive(message, id: id) }
     }
@@ -267,15 +378,28 @@ final class AppModel: ObservableObject {
     Task {
       let result = await runBackend(arguments, channel)
       if FileManager.default.fileExists(atPath: url.path) { remember(url) }
-      operation = nil
       self.channel = nil
+      if result.code == 0, let workflow {
+        operation?.completed = true
+        operation?.cancellable = false
+        operation?.prompt = nil
+        operation?.recovery = ""
+        operation?.message = workflow.resultMessage
+        operation?.detail = result.warnings.joined(separator: "\n\n")
+        return
+      }
+      operation = nil
       var notices = result.warnings
       if result.code == 1 {
         notices.insert(result.error ?? "The operation failed. Check the container's status.", at: 0)
       }
-      if !notices.isEmpty { alert = notices.joined(separator: "\n\n") }
       // Failed Open can still leave a mount. Cancellation never establishes Closed.
-      refresh()
+      if let container = returningToKeys {
+        loadKeys(container, notice: notices.isEmpty ? nil : notices.joined(separator: "\n\n"))
+      } else {
+        if !notices.isEmpty { alert = notices.joined(separator: "\n\n") }
+        refresh()
+      }
     }
   }
 
@@ -290,15 +414,43 @@ final class AppModel: ObservableObject {
 }
 
 struct OperationViewState: Identifiable {
-  enum Prompt: Equatable { case pin, confirmation }
+  enum Prompt: Equatable { case pin, confirmation, connect }
   let id: UUID
   let title: String
+  var confirmationAction = "Continue"
+  var workflow: Workflow?
+  var step: WorkflowStep?
+  var returningToKeys: SavedContainer?
+  var completed = false
   var message = "Checking the container…"
   var detail = ""
   var prompt: Prompt?
   var recovery = ""
   var cancellable = true
   var cancelled = false
+
+  var stepIndex: Int { workflow?.steps.firstIndex(where: { $0 == step }) ?? 0 }
+  var heading: String {
+    guard let workflow else { return title }
+    if completed { return workflow.outcome }
+    return workflow.title(for: step ?? workflow.steps[0])
+  }
+}
+
+struct KeyManagerState: Identifiable {
+  let id = UUID()
+  var container: SavedContainer
+  var labels: [String] = []
+  var loading = true
+  var error: String?
+  var notice: String?
+  var keys: [EnrolledKey] { labels.map { EnrolledKey(name: $0) } }
+}
+
+struct EnrolledKey: Identifiable {
+  let name: String
+  // Vault labels use UTF-8 identity. Swift String equality merges canonical Unicode spellings.
+  var id: Data { Data(name.utf8) }
 }
 
 @MainActor

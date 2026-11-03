@@ -14,7 +14,7 @@ use crate::cli::{Command, HELP, Shell};
 use crate::keys::Keys;
 use crate::passphrase::Passphrase;
 use crate::slots::{self, APP, HASH_META, SECRET};
-use crate::ui::{Ui, field};
+use crate::ui::{Step, Ui, field};
 use crate::veracrypt::{Close, HASH, HELPER, Mount, VeraCrypt};
 
 pub const ZSH: &str = include_str!("../completions/_fido2veracrypt");
@@ -236,6 +236,8 @@ fn create(t: &mut Tools, container: &Path, size: u64, label: &str) -> Result<()>
     let enrollment = t.keys.enroll(&salt, &[])?;
     let passphrase = Passphrase::generate()?;
     show_recovery(t.ui, &passphrase)?;
+    t.ui.step(Step::Write)?;
+    t.ui.begin_work("Creating container…")?;
     let mut vault = Vault::create(
         APP,
         salt,
@@ -326,6 +328,7 @@ fn open(t: &mut Tools, container: &Path) -> Result<()> {
     let unlocked = unlock(t, container)?;
     let passphrase = current(&unlocked)?;
     let hash = hash_of(&unlocked.vault);
+    t.ui.begin_work("Opening container…")?;
     if t.vc.mount(container, &passphrase, hash.as_deref())? == Mount::WrongPassphrase {
         bail!(ANOTHER_CONTAINER);
     }
@@ -421,6 +424,8 @@ fn add_key(t: &mut Tools, container: &Path, label: &str) -> Result<()> {
     let enrollment = t
         .keys
         .enroll(&unlocked.vault.salt(), &unlocked.vault.cred_ids())?;
+    t.ui.step(Step::Write)?;
+    t.ui.begin_work("Adding key…")?;
     unlocked
         .vault
         .add_key(&unlocked.unlocks, label, &enrollment)?;
@@ -513,6 +518,8 @@ fn remove_key(t: &mut Tools, container: &Path, labels: &[String]) -> Result<()> 
     }
     let new = Passphrase::generate()?;
     show_recovery(t.ui, &new)?;
+    t.ui.step(Step::Write)?;
+    t.ui.begin_work("Removing keys…")?;
     unlocked.vault.remove_keys(&labels, &unlocked.unlocks)?;
     unlocked
         .vault
@@ -531,6 +538,8 @@ fn rotate(t: &mut Tools, container: &Path) -> Result<()> {
     require_finished(&unlocked)?;
     let new = Passphrase::generate()?;
     show_recovery(t.ui, &new)?;
+    t.ui.step(Step::Write)?;
+    t.ui.begin_work("Changing recovery phrase…")?;
     unlocked
         .vault
         .set_pending(&unlocked.unlocks, SECRET, new.as_str().as_bytes())?;
@@ -613,6 +622,7 @@ fn require_sources(volumes: &[crate::veracrypt::Volume]) -> Result<()> {
 fn list_keys(t: &mut Tools, container: &Path) -> Result<()> {
     let (_, vault) = load(container)?;
     for key in vault.keys() {
+        t.ui.key_label(key.label)?;
         let aaguid = key
             .aaguid
             .map(|a| a.iter().map(|b| format!("{b:02x}")).collect::<String>())
@@ -634,6 +644,7 @@ fn list_keys(t: &mut Tools, container: &Path) -> Result<()> {
 
 /// Shows the passphrase and has the owner type its last group back before anything is written.
 fn show_recovery(ui: &mut dyn Ui, passphrase: &Passphrase) -> Result<()> {
+    ui.step(Step::Recovery)?;
     ui.say(
         "Your recovery passphrase. Write it down and keep it away from the drive. VeraCrypt alone opens the container with it, typed exactly as shown, dashes included:",
     );
@@ -698,6 +709,13 @@ fn finish_pending(t: &mut Tools, container: &Path, unlocked: &mut Unlocked) -> R
     if !unlocked.vault.has_pending(SECRET) {
         return Ok(());
     }
+    // Even opens() attaches a volume temporarily, so cancellation must stop before probing.
+    t.ui.begin_work("Finishing an earlier change…")?;
+    repair_pending(t, container, unlocked)?;
+    t.ui.end_work()
+}
+
+fn repair_pending(t: &mut Tools, container: &Path, unlocked: &mut Unlocked) -> Result<()> {
     let current = current(unlocked)?;
     let pending = pending(unlocked)?;
     let hash = hash_of(&unlocked.vault);

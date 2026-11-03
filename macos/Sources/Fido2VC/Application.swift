@@ -91,9 +91,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // Rust returns; quitting must not cancel or free that context early.
     let allowed = model.shouldQuit {
       let alert = NSAlert()
-      alert.messageText = "Containers can stay open after you quit."
+      alert.messageText = "Quitting does not close containers."
       alert.informativeText =
-        "Close them in Fido2VC first, or leave them open for now. Removing the key does not close them."
+        "Close containers first. Removing the key does not close them."
       alert.addButton(withTitle: "Cancel")
       alert.addButton(withTitle: "Quit and Leave Open")
       return alert.runModal() == .alertSecondButtonReturn
@@ -120,7 +120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let image =
       Bundle.main.url(forResource: "MenuBarIcon", withExtension: "pdf").flatMap(
         NSImage.init(contentsOf:))
-      ?? NSImage(systemSymbolName: "lock.shield", accessibilityDescription: "Fido2VC")
+      ?? NSImage(systemSymbolName: "archivebox", accessibilityDescription: "Fido2VC")
     image?.size = NSSize(width: 22, height: 22)
     image?.isTemplate = true
     item.button?.image = image
@@ -200,6 +200,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     fileItem.submenu = fileMenu
     menu.addItem(fileItem)
+    let editItem = NSMenuItem()
+    let editMenu = NSMenu(title: "Edit")
+    for (title, action, key) in [
+      ("Cut", #selector(NSText.cut(_:)), "x"), ("Copy", #selector(NSText.copy(_:)), "c"),
+      ("Paste", #selector(NSText.paste(_:)), "v"),
+      ("Select All", #selector(NSText.selectAll(_:)), "a"),
+    ] {
+      editMenu.addItem(withTitle: title, action: action, keyEquivalent: key)
+    }
+    editItem.submenu = editMenu
+    menu.addItem(editItem)
     NSApp.mainMenu = menu
   }
 }

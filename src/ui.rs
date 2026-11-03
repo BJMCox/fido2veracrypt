@@ -5,8 +5,33 @@ use std::io::{BufRead, Write};
 use anyhow::{Context, Result};
 use zeroize::Zeroizing;
 
+/// A visible step in a multi-stage operation. This does not change cancellation policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    Authenticate,
+    Connect,
+    Enroll,
+    Recovery,
+    Write,
+}
+
 pub trait Ui {
     fn say(&mut self, text: &str);
+    fn step(&mut self, _step: Step) -> Result<()> {
+        Ok(())
+    }
+    /// A key label, separate from its human-readable listing.
+    fn key_label(&mut self, _label: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Check cancellation before persistent changes or temporary volume attachments.
+    fn begin_work(&mut self, _message: &str) -> Result<()> {
+        Ok(())
+    }
+    /// A completed repair reached a stable state; later prompts may be cancelled again.
+    fn end_work(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// A warning that remains visible after a successful operation.
     fn warn(&mut self, text: &str) {
         self.say(text);

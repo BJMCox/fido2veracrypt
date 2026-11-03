@@ -4,6 +4,7 @@ import Foundation
 enum BackendEvent: UInt32, Sendable {
   case info = 1
   case pin, confirm, recovery, touch, working, volume, error, check, warning
+  case keyLabel, connect, ready, step
 }
 
 struct BackendMessage: Sendable {
@@ -17,6 +18,7 @@ struct BackendResult: Sendable {
   let error: String?
   let warnings: [String]
   let volumes: [String: String]
+  let keys: [String]
 }
 
 typealias BackendRunner = @Sendable ([String], OperationChannel) async -> BackendResult
@@ -32,6 +34,7 @@ final class OperationChannel: @unchecked Sendable {
   private var error: String?
   private var warnings: [String] = []
   private var volumes: [String: String] = [:]
+  private var keys: [String] = []
   private let deliver: @Sendable (BackendMessage) -> Void
 
   init(deliver: @escaping @Sendable (BackendMessage) -> Void) { self.deliver = deliver }
@@ -69,6 +72,11 @@ final class OperationChannel: @unchecked Sendable {
     guard !cancelled else { return -1 }
     if message.kind == .check { return 0 }
     if message.kind == .working { cancellable = false }
+    if message.kind == .ready { cancellable = true }
+    if message.kind == .keyLabel {
+      keys.append(message.text)
+      return 0
+    }
     if message.kind == .volume {
       // An attached file can move and its old path can be reused. Keep VeraCrypt's
       // identity; resolving that path now could name a different container.
@@ -77,7 +85,7 @@ final class OperationChannel: @unchecked Sendable {
     }
     if message.kind == .error { error = message.text }
     if message.kind == .warning { warnings.append(message.text) }
-    let needsAnswer = message.kind == .pin || message.kind == .confirm
+    let needsAnswer = message.kind == .pin || message.kind == .confirm || message.kind == .connect
     if needsAnswer { waiting = true }
     deliver(message)
     guard needsAnswer else { return 0 }
@@ -91,7 +99,7 @@ final class OperationChannel: @unchecked Sendable {
   func result(_ code: Int32) -> BackendResult {
     condition.lock()
     defer { condition.unlock() }
-    return BackendResult(code: code, error: error, warnings: warnings, volumes: volumes)
+    return BackendResult(code: code, error: error, warnings: warnings, volumes: volumes, keys: keys)
   }
 }
 
@@ -112,7 +120,14 @@ private let callback: FvcCallback = {
 
 enum RustBackend {
   static func run(_ arguments: [String], channel: OperationChannel) async -> BackendResult {
-    await Task.detached {
+    guard !arguments.contains(where: { $0.contains("\0") }) else {
+      _ = channel.receive(
+        BackendMessage(
+          kind: .error, text: "A name or path contains an unsupported character.", detail: ""),
+        response: nil, capacity: 0)
+      return channel.result(1)
+    }
+    return await Task.detached {
       // These arguments contain only commands, paths, sizes, and labels.
       let strings = arguments.map { strdup($0)! }
       defer {

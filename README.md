@@ -27,7 +27,7 @@ FUSE-T then connects directly to localhost instead of using Bonjour discovery. T
 
 ## Mac app
 
-Fido2VC provides Create, Open, and Close in a native Mac window. It requires macOS 14 or later and the requirements above.
+Fido2VC creates, opens, and closes containers and manages their keys in a native Mac window. It requires macOS 14 or later and the requirements above.
 
 1. Open **Fido2VC.app** and choose **Create**. Pick a location, size, and key name.
 2. Enter the key's PIN in the app and touch the key when prompted.
@@ -39,7 +39,17 @@ The app remembers containers between launches. **Open** also adds an existing co
 
 The menu bar icon shows the status of your saved containers and returns you to the window. Closing the window leaves the app in the menu bar. Quitting the app or removing the key does not close a container.
 
-This first app version supports creation, opening, and closing. Use the CLI below to enroll extra keys, recover a lost key, or change a passphrase.
+Choose **Keys…** in a container's options to see its keys. Close the container before changing them.
+
+Create and key changes show a checklist with the current step and completed steps. Add Key first asks for a key that already opens the container, then asks for the new key. Choose **Done** after the operation finishes.
+
+- **Add Key…** asks for an enrolled key, then the new key. Either key can open the container afterward. The recovery phrase stays the same.
+- **Remove…** revokes the selected keys and changes the recovery phrase. You need every key you keep, but not the removed keys. Save the new phrase before confirming. At least one key must remain.
+- **Change Recovery Phrase…** replaces the phrase and keeps all enrolled keys.
+
+With several keys connected, touch the one to use before entering its PIN. With one key, enter its PIN directly. Enrollment needs two touches after the PIN.
+
+If you lose every enrolled key, use the CLI's `add-key --recovery` command below.
 
 ### Build the app
 
